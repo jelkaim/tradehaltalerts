@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.tradehaltalerts</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/usr/bin/python3</string>
+      <string>/Users/jelk/trade-halt-alerts/scripts/halt_alerts.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>WorkingDirectory</key>
+    <string>/Users/jelk/trade-halt-alerts</string>
+    <key>StandardOutPath</key>
+    <string>/Users/jelk/trade-halt-alerts/logs/launchagent.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/jelk/trade-halt-alerts/logs/launchagent.err</string>
+  </dict>
+</plist>
