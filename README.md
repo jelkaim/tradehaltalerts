@@ -45,6 +45,15 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tradehaltalerts.plis
 launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.tradehaltalerts.plist
 ```
 
+## Friendly control script
+Use `scripts/alerts_ctl.sh` to start or stop alerts.
+```bash
+./scripts/alerts_ctl.sh start
+./scripts/alerts_ctl.sh stop
+./scripts/alerts_ctl.sh restart
+./scripts/alerts_ctl.sh status
+```
+
 ## Notes
 - State is persisted in `~/.tradehaltalerts_state.json` to deduplicate alerts across restarts.
 - Logs are written to `logs/halt_alerts.log` and also printed to stdout.
