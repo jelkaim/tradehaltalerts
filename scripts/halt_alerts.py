@@ -20,6 +20,8 @@ LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 LOG_FILE = LOG_DIR / "halt_alerts.log"
 
 POLL_SECONDS = 60
+TEST_DELAY_FIRST = os.environ.get("HALT_ALERTS_TEST_DELAY_FIRST")
+TEST_DELAY_SECOND = os.environ.get("HALT_ALERTS_TEST_DELAY_SECOND")
 
 
 def setup_logging() -> None:
@@ -265,7 +267,21 @@ def schedule_resume(state: dict, entry: dict, event_id: str) -> None:
     else:
         delay_minutes = 10
 
-    due_at = time.time() + (delay_minutes * 60)
+    delay_seconds = delay_minutes * 60
+    if count == 1 and TEST_DELAY_FIRST:
+        try:
+            delay_seconds = int(TEST_DELAY_FIRST)
+            delay_minutes = max(1, int(round(delay_seconds / 60)))
+        except ValueError:
+            logging.warning("Invalid HALT_ALERTS_TEST_DELAY_FIRST, using default")
+    if count == 2 and TEST_DELAY_SECOND:
+        try:
+            delay_seconds = int(TEST_DELAY_SECOND)
+            delay_minutes = max(1, int(round(delay_seconds / 60)))
+        except ValueError:
+            logging.warning("Invalid HALT_ALERTS_TEST_DELAY_SECOND, using default")
+
+    due_at = time.time() + delay_seconds
     pending = {
         "ticker": ticker,
         "halt_date": halt_date,

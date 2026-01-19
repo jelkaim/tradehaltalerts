@@ -58,3 +58,11 @@ Use `scripts/alerts_ctl.sh` to start or stop alerts.
 - State is persisted in `~/.tradehaltalerts_state.json` to deduplicate alerts across restarts.
 - Logs are written to `logs/halt_alerts.log` and also printed to stdout.
 - If the FMP API key is missing or the API fails, price, market cap, and float show `n/a`.
+
+## Test mode
+To speed up scheduled resume alerts, set these environment variables before starting the script or LaunchAgent.
+```bash
+export HALT_ALERTS_TEST_DELAY_FIRST=15
+export HALT_ALERTS_TEST_DELAY_SECOND=30
+```
+Values are in seconds and only affect the scheduled resume notifications for the first and second halt.
