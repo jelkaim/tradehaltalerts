@@ -41,19 +41,25 @@ def setup_logging() -> None:
 
 def load_state() -> dict:
     if not STATE_PATH.exists():
-        return {"seen_ids": []}
+        return {"seen_ids": [], "pending_resumes": [], "halt_counts": {}}
     try:
         with STATE_PATH.open("r", encoding="utf-8") as handle:
             data = json.load(handle)
         if not isinstance(data, dict):
-            return {"seen_ids": []}
+            return {"seen_ids": [], "pending_resumes": [], "halt_counts": {}}
         data.setdefault("seen_ids", [])
+        data.setdefault("pending_resumes", [])
+        data.setdefault("halt_counts", {})
         if not isinstance(data["seen_ids"], list):
             data["seen_ids"] = []
+        if not isinstance(data["pending_resumes"], list):
+            data["pending_resumes"] = []
+        if not isinstance(data["halt_counts"], dict):
+            data["halt_counts"] = {}
         return data
     except Exception as exc:
         logging.warning("Failed to load state, starting fresh: %s", exc)
-        return {"seen_ids": []}
+        return {"seen_ids": [], "pending_resumes": [], "halt_counts": {}}
 
 
 def save_state(state: dict) -> None:
@@ -220,9 +226,92 @@ def build_body(entry: dict, event_type: str) -> str:
     return "\n".join(lines)
 
 
+def build_scheduled_resume_body(pending: dict) -> str:
+    ticker = pending.get("ticker", "n/a")
+    halt_date = pending.get("halt_date", "n/a")
+    reason = pending.get("reason", "n/a")
+    delay_minutes = pending.get("delay_minutes", "n/a")
+
+    news = fetch_news_summary(ticker)
+    market = fetch_market_data(ticker)
+
+    lines = [
+        f"Ticker: {ticker}",
+        f"Halt date: {halt_date}",
+        f"Reason: {reason}",
+        f"Resume: scheduled after {delay_minutes} minutes",
+        f"News: {news['link']}",
+        f"News summary: {news['summary']}",
+        f"Price: {market['price']}",
+        f"Market cap: {market['market_cap']}",
+        f"Float: {market['float']}",
+    ]
+    return "\n".join(lines)
+
+
+def schedule_resume(state: dict, entry: dict, event_id: str) -> None:
+    ticker = get_first(entry, ["symbol", "ticker"], "UNKNOWN")
+    halt_date = get_first(entry, ["haltdate", "halt_date", "date"], "n/a")
+    reason = get_first(entry, ["reasoncode", "reason_code", "reason"], "n/a")
+
+    halt_counts = state.setdefault("halt_counts", {})
+    count = int(halt_counts.get(ticker, 0)) + 1
+    halt_counts[ticker] = count
+
+    if count == 1:
+        delay_minutes = 5
+    elif count == 2:
+        delay_minutes = 10
+    else:
+        delay_minutes = 10
+
+    due_at = time.time() + (delay_minutes * 60)
+    pending = {
+        "ticker": ticker,
+        "halt_date": halt_date,
+        "reason": reason,
+        "delay_minutes": delay_minutes,
+        "due_at": due_at,
+        "event_id": event_id,
+    }
+    state.setdefault("pending_resumes", []).append(pending)
+
+
+def cancel_pending_for_ticker(state: dict, ticker: str) -> None:
+    pending_list = state.get("pending_resumes", [])
+    state["pending_resumes"] = [p for p in pending_list if p.get("ticker") != ticker]
+
+
+def process_due_resumes(state: dict) -> int:
+    now = time.time()
+    pending_list = state.get("pending_resumes", [])
+    remaining = []
+    sent = 0
+
+    for pending in pending_list:
+        due_at = pending.get("due_at", 0)
+        if due_at and due_at <= now:
+            ticker = pending.get("ticker", "UNKNOWN")
+            title = f"RESUME: {ticker}"
+            body = build_scheduled_resume_body(pending)
+            send_notification(title, body)
+            logging.info("Sent scheduled RESUME for %s", ticker)
+            state.setdefault("halt_counts", {})[ticker] = 0
+            sent += 1
+        else:
+            remaining.append(pending)
+
+    state["pending_resumes"] = remaining
+    if sent:
+        save_state(state)
+    return sent
+
+
 def process_feed(state: dict) -> int:
     seen_ids = set(state.get("seen_ids", []))
     new_count = 0
+
+    new_count += process_due_resumes(state)
 
     feed = fetch_rss(TRADE_HALTS_RSS)
     for entry in feed.entries:
@@ -237,6 +326,12 @@ def process_feed(state: dict) -> int:
 
         send_notification(title, body)
         logging.info("Notified %s for %s", event_type, ticker)
+
+        if event_type == "HALT":
+            schedule_resume(state, entry, event_id)
+        else:
+            cancel_pending_for_ticker(state, ticker)
+            state.setdefault("halt_counts", {})[ticker] = 0
 
         seen_ids.add(event_id)
         new_count += 1
