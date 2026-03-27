@@ -67,3 +67,10 @@ export HALT_ALERTS_TEST_DELAY_SECOND=30
 export HALT_ALERTS_TEST_MODE=1
 ```
 Values are in seconds and only affect the scheduled resume notifications for the first and second halt. When test mode is enabled, notifications are labeled as test alerts.
+
+To send a single test notification without using the feed:
+```bash
+python3 scripts/halt_alerts.py --test-notify
+```
+
+Notifications include a sound. The current sound is `Glass`.

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import hashlib
 import json
 import logging
@@ -198,7 +199,12 @@ def fetch_news_summary(ticker: str) -> dict:
 
 
 def send_notification(title: str, body: str) -> None:
-    script = f"display notification {json.dumps(body)} with title {json.dumps(title)}"
+    safe_title = sanitize_for_osascript(title)
+    safe_body = sanitize_for_osascript(body)
+    script = (
+        f"display notification {json.dumps(safe_body)} with title {json.dumps(safe_title)} "
+        f"sound name {json.dumps('Glass')}"
+    )
     try:
         subprocess.run(["osascript", "-e", script], check=False)
     except Exception as exc:
@@ -230,6 +236,12 @@ def build_body(entry: dict, event_type: str) -> str:
         resume_time = get_first(entry, ["resumetime", "resume_time"], "n/a")
         lines.insert(2, f"Resume: {resume_date} {resume_time}".strip())
     return "\n".join(lines)
+
+
+def sanitize_for_osascript(text: str) -> str:
+    if not isinstance(text, str):
+        text = str(text)
+    return "".join(ch if ch == "\n" or ch >= " " else " " for ch in text)
 
 
 def build_scheduled_resume_body(pending: dict) -> str:
@@ -370,6 +382,29 @@ def process_feed(state: dict) -> int:
 
 def main() -> None:
     setup_logging()
+    parser = argparse.ArgumentParser(description="Trade halt alerts")
+    parser.add_argument("--test-notify", action="store_true", help="Send a single test notification and exit")
+    args = parser.parse_args()
+
+    if args.test_notify:
+        title = "TEST HALT: DEMO"
+        body = "\n".join(
+            [
+                "Test alert",
+                "Ticker: TEST",
+                "Halt date: 2026-03-26",
+                "Reason: TEST",
+                "News: n/a",
+                "News summary: n/a",
+                "Price: n/a",
+                "Market cap: n/a",
+                "Float: n/a",
+            ]
+        )
+        send_notification(title, body)
+        logging.info("Sent test notification")
+        return
+
     logging.info("Starting trade halt alerts")
     state = load_state()
 
