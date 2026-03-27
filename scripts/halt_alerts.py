@@ -22,6 +22,8 @@ LOG_FILE = LOG_DIR / "halt_alerts.log"
 POLL_SECONDS = 60
 TEST_DELAY_FIRST = os.environ.get("HALT_ALERTS_TEST_DELAY_FIRST")
 TEST_DELAY_SECOND = os.environ.get("HALT_ALERTS_TEST_DELAY_SECOND")
+TEST_MODE_FLAG = os.environ.get("HALT_ALERTS_TEST_MODE")
+TEST_MODE = bool(TEST_MODE_FLAG or TEST_DELAY_FIRST or TEST_DELAY_SECOND)
 
 
 def setup_logging() -> None:
@@ -221,6 +223,8 @@ def build_body(entry: dict, event_type: str) -> str:
         f"Market cap: {market['market_cap']}",
         f"Float: {market['float']}",
     ]
+    if TEST_MODE:
+        lines.insert(0, "Test alert")
     if event_type == "RESUME":
         resume_date = get_first(entry, ["resumedate", "resume_date"], "n/a")
         resume_time = get_first(entry, ["resumetime", "resume_time"], "n/a")
@@ -248,6 +252,8 @@ def build_scheduled_resume_body(pending: dict) -> str:
         f"Market cap: {market['market_cap']}",
         f"Float: {market['float']}",
     ]
+    if TEST_MODE:
+        lines.insert(0, "Test alert")
     return "\n".join(lines)
 
 
@@ -309,6 +315,8 @@ def process_due_resumes(state: dict) -> int:
         if due_at and due_at <= now:
             ticker = pending.get("ticker", "UNKNOWN")
             title = f"RESUME: {ticker}"
+            if TEST_MODE:
+                title = f"TEST {title}"
             body = build_scheduled_resume_body(pending)
             send_notification(title, body)
             logging.info("Sent scheduled RESUME for %s", ticker)
@@ -338,6 +346,8 @@ def process_feed(state: dict) -> int:
 
         ticker = get_first(entry, ["symbol", "ticker"], "UNKNOWN")
         title = f"{event_type}: {ticker}"
+        if TEST_MODE:
+            title = f"TEST {title}"
         body = build_body(entry, event_type)
 
         send_notification(title, body)
