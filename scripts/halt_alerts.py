@@ -41,6 +41,9 @@ X_API_BEARER_TOKEN = os.environ.get("X_API_BEARER_TOKEN")
 X_SEARCH_URL = "https://api.x.com/2/tweets/search/recent"
 DETAILS_PORT = int(os.environ.get("HALT_ALERTS_DETAILS_PORT", "8787"))
 DETAILS_HOST = "127.0.0.1"
+TERMINAL_NOTIFIER_SENDER = os.environ.get("TERMINAL_NOTIFIER_SENDER")
+TERMINAL_NOTIFIER_ACTIVATE = os.environ.get("TERMINAL_NOTIFIER_ACTIVATE")
+OPEN_DETAILS = os.environ.get("HALT_ALERTS_OPEN_DETAILS", "").lower() == "auto"
 
 
 def setup_logging() -> None:
@@ -441,17 +444,28 @@ def fetch_latest_tweet(ticker: str, company_name: Optional[str] = None) -> Optio
     return None
 
 
-def has_terminal_notifier() -> bool:
-    return bool(shutil.which("terminal-notifier"))
+def terminal_notifier_path() -> Optional[str]:
+    env_path = os.environ.get("TERMINAL_NOTIFIER_PATH")
+    if env_path and os.path.exists(env_path):
+        return env_path
+    path = shutil.which("terminal-notifier")
+    if path:
+        return path
+    for candidate in ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier"):
+        if os.path.exists(candidate):
+            return candidate
+    return None
 
 
 def send_notification(title: str, body: str, open_url: Optional[str] = None) -> None:
     safe_title = sanitize_for_osascript(title)
     safe_body = sanitize_for_osascript(body)
     try:
-        if has_terminal_notifier():
+        notifier = terminal_notifier_path()
+        if notifier:
+            logging.info("Using terminal-notifier: %s", notifier)
             args = [
-                "terminal-notifier",
+                notifier,
                 "-title",
                 safe_title,
                 "-message",
@@ -459,15 +473,23 @@ def send_notification(title: str, body: str, open_url: Optional[str] = None) -> 
                 "-sound",
                 "Glass",
             ]
-            if open_url:
-                args.extend(["-open", open_url])
+            if TERMINAL_NOTIFIER_SENDER:
+                args.extend(["-sender", TERMINAL_NOTIFIER_SENDER])
+            if TERMINAL_NOTIFIER_ACTIVATE:
+                args.extend(["-activate", TERMINAL_NOTIFIER_ACTIVATE])
+            if open_url and open_url.startswith("http"):
+                logging.info("Notification open URL: %s", open_url)
+                args.extend(["-open", open_url, "-execute", f"open {open_url}"])
             subprocess.run(args, check=False)
         else:
+            logging.info("Using osascript notifications (no terminal-notifier found)")
             script = (
                 f"display notification {json.dumps(safe_body)} with title {json.dumps(safe_title)} "
                 f"sound name {json.dumps('Glass')}"
             )
             subprocess.run(["osascript", "-e", script], check=False)
+        if OPEN_DETAILS and open_url and open_url.startswith("http"):
+            subprocess.run(["open", open_url], check=False)
     except Exception as exc:
         logging.warning("Notification failed: %s", exc)
 
@@ -822,6 +844,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Trade halt alerts")
     parser.add_argument("--test-notify", action="store_true", help="Send a single test notification and exit")
     parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Print notification integration status and exit",
+    )
+    parser.add_argument(
         "--keep-alive-seconds",
         type=int,
         default=0,
@@ -829,11 +856,17 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    details_ready = start_details_server()
+    if args.self_test:
+        notifier = terminal_notifier_path()
+        print("terminal_notifier:", notifier or "not found")
+        print("details_url:", details_url("test-alert"))
+        return
+
+    start_details_server()
 
     if args.test_notify:
         title = "TEST HALT: DEMO"
-        more_details = details_url("test-alert") if details_ready else "n/a"
+        more_details = details_url("test-alert")
         body = "\n".join(
             [
                 "Test alert",

@@ -69,6 +69,9 @@ Use `scripts/alerts_ctl.sh` to start or stop alerts.
 - If Google News has no results, the app can query the X API for a recent tweet within the last 48 hours using `X_API_BEARER_TOKEN`. If neither source has results, it shows \"No recent news or tweets\".
 - Each notification includes a \"More details\" link to a local details page served at `http://127.0.0.1:8787/alerts/<event_id>`. You can change the port with `HALT_ALERTS_DETAILS_PORT`.
 - If `terminal-notifier` is installed, clicking the notification opens the \"More details\" link. Otherwise it falls back to `osascript` with no click action.
+- If the LaunchAgent cannot find `terminal-notifier`, set `TERMINAL_NOTIFIER_PATH` to the full path, for example `/opt/homebrew/bin/terminal-notifier`.
+- If notifications do not appear for `terminal-notifier`, set `TERMINAL_NOTIFIER_SENDER=com.apple.Terminal` so it uses Terminal's notification permissions. You can also set `TERMINAL_NOTIFIER_ACTIVATE=com.apple.Terminal`.
+- If clicking is unreliable, set `HALT_ALERTS_OPEN_DETAILS=auto` to automatically open the details page when a notification is sent.
 
 ## Test mode
 To speed up scheduled resume alerts, set these environment variables before starting the script or LaunchAgent.
@@ -82,6 +85,11 @@ Values are in seconds and only affect the scheduled resume notifications for the
 To send a single test notification without using the feed:
 ```bash
 python3 scripts/halt_alerts.py --test-notify --keep-alive-seconds 60
+```
+
+To check notification integration status:
+```bash
+python3 scripts/halt_alerts.py --self-test
 ```
 
 Notifications include a sound. The current sound is `Glass`.
