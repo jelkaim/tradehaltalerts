@@ -60,6 +60,7 @@ Use `scripts/alerts_ctl.sh` to start or stop alerts.
 - If the FMP API key is missing or the API fails, price, market cap, and float show `n/a`.
 - Trade halts are fetched from NasdaqTrader RSS first, then the NasdaqTrader Trade Halts page, then the NYSE CSV endpoint as a fallback.
 - Events are deduplicated across all sources using a source independent event id.
+- On first run, existing halts are seeded as seen to avoid a notification flood. Only new halts after startup trigger alerts.
 
 ## Test mode
 To speed up scheduled resume alerts, set these environment variables before starting the script or LaunchAgent.

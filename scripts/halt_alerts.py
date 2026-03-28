@@ -53,15 +53,16 @@ def setup_logging() -> None:
 
 def load_state() -> dict:
     if not STATE_PATH.exists():
-        return {"seen_ids": [], "pending_resumes": [], "halt_counts": {}}
+        return {"seen_ids": [], "pending_resumes": [], "halt_counts": {}, "last_poll": 0}
     try:
         with STATE_PATH.open("r", encoding="utf-8") as handle:
             data = json.load(handle)
         if not isinstance(data, dict):
-            return {"seen_ids": [], "pending_resumes": [], "halt_counts": {}}
+            return {"seen_ids": [], "pending_resumes": [], "halt_counts": {}, "last_poll": 0}
         data.setdefault("seen_ids", [])
         data.setdefault("pending_resumes", [])
         data.setdefault("halt_counts", {})
+        data.setdefault("last_poll", 0)
         if not isinstance(data["seen_ids"], list):
             data["seen_ids"] = []
         if not isinstance(data["pending_resumes"], list):
@@ -71,7 +72,7 @@ def load_state() -> dict:
         return data
     except Exception as exc:
         logging.warning("Failed to load state, starting fresh: %s", exc)
-        return {"seen_ids": [], "pending_resumes": [], "halt_counts": {}}
+        return {"seen_ids": [], "pending_resumes": [], "halt_counts": {}, "last_poll": 0}
 
 
 def save_state(state: dict) -> None:
@@ -150,6 +151,20 @@ def normalize_row(row: dict) -> dict:
         if key in mapping:
             normalized[mapping[key]] = value.strip() if isinstance(value, str) else value
     return normalized
+
+
+def parse_halt_datetime(entry: dict) -> Optional[float]:
+    date_raw = get_first(entry, ["haltdate", "halt_date", "date"])
+    time_raw = get_first(entry, ["halttime", "halt_time"])
+    if not date_raw or not time_raw:
+        return None
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M:%S"):
+        try:
+            return time.mktime(time.strptime(f"{date_raw} {time_raw}", fmt))
+        except ValueError:
+            continue
+    return None
 
 
 def detect_event_type(entry: dict) -> str:
@@ -487,10 +502,27 @@ def process_feed(state: dict) -> int:
     new_count += process_due_resumes(state)
 
     entries = fetch_trade_halts()
+    if not seen_ids and entries:
+        for entry in entries:
+            event_type = detect_event_type(entry)
+            event_id = event_id_for(entry, event_type)
+            seen_ids.add(event_id)
+        state["seen_ids"] = list(seen_ids)
+        state["last_poll"] = time.time()
+        save_state(state)
+        logging.info("Seeded %s existing events without notifying", len(entries))
+        return new_count
+
+    last_poll = float(state.get("last_poll", 0) or 0)
     for entry in entries:
         event_type = detect_event_type(entry)
         event_id = event_id_for(entry, event_type)
         if event_id in seen_ids:
+            continue
+
+        halt_ts = parse_halt_datetime(entry)
+        if halt_ts and last_poll and halt_ts <= last_poll:
+            seen_ids.add(event_id)
             continue
 
         ticker = get_first(entry, ["symbol", "ticker"], "UNKNOWN")
@@ -512,6 +544,7 @@ def process_feed(state: dict) -> int:
         new_count += 1
 
     state["seen_ids"] = list(seen_ids)
+    state["last_poll"] = time.time()
     if new_count:
         save_state(state)
     return new_count
