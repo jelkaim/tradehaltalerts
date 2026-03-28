@@ -332,22 +332,32 @@ def shorten(text: str, limit: int = 80) -> str:
     return text[: limit - 3].rstrip() + "..."
 
 
-def fetch_news_summary(ticker: str) -> dict:
-    query = f"{ticker} stock"
-    url = GOOGLE_NEWS_RSS.format(query=requests.utils.quote(query))
-    try:
-        feed = fetch_rss(url)
-        entries = feed.entries[:3]
-        if not entries:
-            return {"link": "n/a", "summary": "n/a"}
+def fetch_news_summary(ticker: str, company_name: Optional[str] = None) -> dict:
+    queries = []
+    if ticker:
+        queries.append(f"{ticker} stock")
+    if company_name:
+        queries.append(company_name)
+    if ticker and company_name:
+        queries.append(f"{ticker} OR \"{company_name}\"")
 
-        headlines = [shorten(entry.get("title", "")) for entry in entries if entry.get("title")]
-        summary = "; ".join(headlines) if headlines else "n/a"
-        link = entries[0].get("link") or "n/a"
-        return {"link": link, "summary": summary}
-    except Exception as exc:
-        logging.warning("News fetch failed for %s: %s", ticker, exc)
-        return {"link": "n/a", "summary": "n/a"}
+    for query in queries:
+        url = GOOGLE_NEWS_RSS.format(query=requests.utils.quote(query))
+        try:
+            feed = fetch_rss(url)
+            entries = feed.entries[:3]
+            if not entries:
+                continue
+
+            headlines = [shorten(entry.get("title", "")) for entry in entries if entry.get("title")]
+            summary = "; ".join(headlines) if headlines else "n/a"
+            link = entries[0].get("link") or "n/a"
+            return {"link": link, "summary": summary}
+        except Exception as exc:
+            logging.warning("News fetch failed for %s: %s", query, exc)
+            continue
+
+    return {"link": "n/a", "summary": "No recent Google News results"}
 
 
 def send_notification(title: str, body: str) -> None:
@@ -367,8 +377,9 @@ def build_body(entry: dict, event_type: str) -> str:
     ticker = get_first(entry, ["symbol", "ticker", "title"], "n/a")
     halt_date = get_first(entry, ["haltdate", "halt_date", "date"], "n/a")
     reason = get_first(entry, ["reasoncode", "reason_code", "reason"], "n/a")
+    company_name = get_first(entry, ["name"], "")
 
-    news = fetch_news_summary(ticker)
+    news = fetch_news_summary(ticker, company_name)
     market = fetch_market_data(ticker)
 
     lines = [
@@ -401,8 +412,9 @@ def build_scheduled_resume_body(pending: dict) -> str:
     halt_date = pending.get("halt_date", "n/a")
     reason = pending.get("reason", "n/a")
     delay_minutes = pending.get("delay_minutes", "n/a")
+    company_name = pending.get("company_name", "")
 
-    news = fetch_news_summary(ticker)
+    news = fetch_news_summary(ticker, company_name)
     market = fetch_market_data(ticker)
 
     lines = [
@@ -425,6 +437,7 @@ def schedule_resume(state: dict, entry: dict, event_id: str) -> None:
     ticker = get_first(entry, ["symbol", "ticker"], "UNKNOWN")
     halt_date = get_first(entry, ["haltdate", "halt_date", "date"], "n/a")
     reason = get_first(entry, ["reasoncode", "reason_code", "reason"], "n/a")
+    company_name = get_first(entry, ["name"], "")
 
     halt_counts = state.setdefault("halt_counts", {})
     count = int(halt_counts.get(ticker, 0)) + 1
@@ -456,6 +469,7 @@ def schedule_resume(state: dict, entry: dict, event_id: str) -> None:
         "ticker": ticker,
         "halt_date": halt_date,
         "reason": reason,
+        "company_name": company_name,
         "delay_minutes": delay_minutes,
         "due_at": due_at,
         "event_id": event_id,

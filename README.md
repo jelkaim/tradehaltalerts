@@ -61,6 +61,7 @@ Use `scripts/alerts_ctl.sh` to start or stop alerts.
 - Trade halts are fetched from NasdaqTrader RSS first, then the NasdaqTrader Trade Halts page, then the NYSE CSV endpoint as a fallback.
 - Events are deduplicated across all sources using a source independent event id.
 - On first run, existing halts are seeded as seen to avoid a notification flood. Only new halts after startup trigger alerts.
+- Google News enrichment tries multiple queries using the ticker and company name, and falls back to a clear \"No recent Google News results\" message if nothing is found.
 
 ## Test mode
 To speed up scheduled resume alerts, set these environment variables before starting the script or LaunchAgent.
