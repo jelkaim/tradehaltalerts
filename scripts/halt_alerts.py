@@ -44,6 +44,14 @@ DETAILS_HOST = "127.0.0.1"
 TERMINAL_NOTIFIER_SENDER = os.environ.get("TERMINAL_NOTIFIER_SENDER")
 TERMINAL_NOTIFIER_ACTIVATE = os.environ.get("TERMINAL_NOTIFIER_ACTIVATE")
 OPEN_DETAILS = os.environ.get("HALT_ALERTS_OPEN_DETAILS", "").lower() == "auto"
+ALPHAVANTAGE_API_KEY = os.environ.get("ALPHAVANTAGE_API_KEY")
+SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT", "TradeHaltAlerts/1.0")
+
+ALPHAVANTAGE_QUOTE_URL = "https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker}&apikey={apikey}"
+SEC_TICKER_CIK_URL = "https://www.sec.gov/files/company_tickers.json"
+SEC_COMPANY_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+
+_SEC_TICKER_CIK_CACHE = {"data": {}, "timestamp": 0.0}
 
 
 def setup_logging() -> None:
@@ -123,6 +131,93 @@ def request_with_retries(url: str, timeout: int = 20, max_attempts: int = 3) -> 
 def fetch_rss(url: str) -> feedparser.FeedParserDict:
     content = request_with_retries(url, timeout=20, max_attempts=3)
     return feedparser.parse(content)
+
+
+def fetch_alphavantage_price(ticker: str) -> Optional[float]:
+    if not ALPHAVANTAGE_API_KEY:
+        return None
+    try:
+        url = ALPHAVANTAGE_QUOTE_URL.format(ticker=ticker, apikey=ALPHAVANTAGE_API_KEY)
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+        quote = data.get("Global Quote", {})
+        price_str = quote.get("05. price") or quote.get("05. price ")
+        if not price_str:
+            return None
+        return float(price_str)
+    except Exception as exc:
+        logging.warning("Alpha Vantage price failed for %s: %s", ticker, exc)
+        return None
+
+
+def fetch_sec_ticker_cik_map() -> dict:
+    now = time.time()
+    cached = _SEC_TICKER_CIK_CACHE.get("data", {})
+    if cached and now - _SEC_TICKER_CIK_CACHE.get("timestamp", 0) < 24 * 3600:
+        return cached
+    try:
+        response = requests.get(SEC_TICKER_CIK_URL, headers={"User-Agent": SEC_USER_AGENT}, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+        mapping = {}
+        for entry in data.values():
+            ticker = str(entry.get("ticker", "")).upper()
+            cik = str(entry.get("cik_str", "")).zfill(10)
+            if ticker and cik:
+                mapping[ticker] = cik
+        _SEC_TICKER_CIK_CACHE["data"] = mapping
+        _SEC_TICKER_CIK_CACHE["timestamp"] = now
+        return mapping
+    except Exception as exc:
+        logging.warning("SEC ticker map fetch failed: %s", exc)
+        return cached
+
+
+def select_latest_fact(items: list) -> Optional[float]:
+    best_val = None
+    best_date = None
+    for item in items:
+        end = item.get("end") or item.get("instant")
+        val = item.get("val")
+        if end is None or val is None:
+            continue
+        try:
+            end_dt = datetime.fromisoformat(end)
+        except ValueError:
+            continue
+        if best_date is None or end_dt > best_date:
+            best_date = end_dt
+            best_val = val
+    return best_val
+
+
+def fetch_sec_shares_outstanding(ticker: str) -> Optional[float]:
+    try:
+        cik_map = fetch_sec_ticker_cik_map()
+        cik = cik_map.get(ticker.upper())
+        if not cik:
+            return None
+        url = SEC_COMPANY_FACTS_URL.format(cik=cik)
+        response = requests.get(url, headers={"User-Agent": SEC_USER_AGENT}, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+        facts = data.get("facts", {})
+        candidates = [
+            ("us-gaap", "CommonStockSharesOutstanding"),
+            ("dei", "EntityCommonStockSharesOutstanding"),
+        ]
+        for namespace, tag in candidates:
+            tag_data = facts.get(namespace, {}).get(tag, {})
+            units = tag_data.get("units", {})
+            for unit_values in units.values():
+                val = select_latest_fact(unit_values)
+                if val is not None:
+                    return float(val)
+        return None
+    except Exception as exc:
+        logging.warning("SEC shares outstanding failed for %s: %s", ticker, exc)
+        return None
 
 
 def get_first(entry: dict, keys: List[str], default: str = "") -> str:
@@ -327,25 +422,31 @@ def format_price(value: Optional[Union[float, int]]) -> str:
 
 def fetch_market_data(ticker: str) -> dict:
     api_key = os.environ.get("FMP_API_KEY")
-    if not api_key:
-        return {"price": "n/a", "market_cap": "n/a", "float": "n/a"}
+    if api_key:
+        try:
+            url = FMP_QUOTE_URL.format(ticker=ticker, apikey=api_key)
+            response = requests.get(url, timeout=20)
+            response.raise_for_status()
+            data = response.json()
+            if not data:
+                raise ValueError("empty response")
+            quote = data[0]
+            return {
+                "price": format_price(quote.get("price")),
+                "market_cap": format_compact(quote.get("marketCap")),
+                "float": format_compact(quote.get("sharesFloat")),
+            }
+        except Exception as exc:
+            logging.warning("FMP market data failed for %s: %s", ticker, exc)
 
-    try:
-        url = FMP_QUOTE_URL.format(ticker=ticker, apikey=api_key)
-        response = requests.get(url, timeout=20)
-        response.raise_for_status()
-        data = response.json()
-        if not data:
-            raise ValueError("empty response")
-        quote = data[0]
-        return {
-            "price": format_price(quote.get("price")),
-            "market_cap": format_compact(quote.get("marketCap")),
-            "float": format_compact(quote.get("sharesFloat")),
-        }
-    except Exception as exc:
-        logging.warning("Market data failed for %s: %s", ticker, exc)
-        return {"price": "n/a", "market_cap": "n/a", "float": "n/a"}
+    price = fetch_alphavantage_price(ticker)
+    shares = fetch_sec_shares_outstanding(ticker)
+    market_cap = price * shares if price is not None and shares is not None else None
+    return {
+        "price": format_price(price),
+        "market_cap": format_compact(market_cap),
+        "float": "n/a",
+    }
 
 
 def shorten(text: str, limit: int = 80) -> str:

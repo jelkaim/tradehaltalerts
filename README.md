@@ -24,6 +24,8 @@ brew install terminal-notifier
 cd /Users/jelk/trade-halt-alerts
 source .venv/bin/activate
 export FMP_API_KEY="your_key_here"
+export ALPHAVANTAGE_API_KEY="your_key_here"
+export SEC_USER_AGENT="TradeHaltAlerts/1.0 (your_email@example.com)"
 python3 scripts/halt_alerts.py
 ```
 
@@ -62,6 +64,8 @@ Use `scripts/alerts_ctl.sh` to start or stop alerts.
 - State is persisted in `~/.tradehaltalerts_state.json` to deduplicate alerts across restarts.
 - Logs are written to `logs/halt_alerts.log` and also printed to stdout.
 - If the FMP API key is missing or the API fails, price, market cap, and float show `n/a`.
+- Optional fallback: set `ALPHAVANTAGE_API_KEY` to fetch price from Alpha Vantage and compute market cap using SEC shares outstanding. Float remains `n/a`.
+- For SEC requests, you can set `SEC_USER_AGENT` to a descriptive value with contact info.
 - Trade halts are fetched from NasdaqTrader RSS first, then the NasdaqTrader Trade Halts page, then the NYSE CSV endpoint as a fallback.
 - Events are deduplicated across all sources using a source independent event id.
 - On first run, existing halts are seeded as seen to avoid a notification flood. Only new halts after startup trigger alerts.
