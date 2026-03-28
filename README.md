@@ -62,6 +62,7 @@ Use `scripts/alerts_ctl.sh` to start or stop alerts.
 - Events are deduplicated across all sources using a source independent event id.
 - On first run, existing halts are seeded as seen to avoid a notification flood. Only new halts after startup trigger alerts.
 - Google News enrichment tries multiple queries using the ticker and company name, and falls back to a clear \"No recent Google News results\" message if nothing is found.
+- If Google News has no results, the app can query the X API for a recent tweet within the last 48 hours using `X_API_BEARER_TOKEN`. If neither source has results, it shows \"No recent news or tweets\".
 
 ## Test mode
 To speed up scheduled resume alerts, set these environment variables before starting the script or LaunchAgent.

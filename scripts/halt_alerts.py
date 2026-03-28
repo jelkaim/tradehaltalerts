@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import time
+from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
 from typing import List, Optional, Union
@@ -32,6 +33,8 @@ TEST_DELAY_SECOND = os.environ.get("HALT_ALERTS_TEST_DELAY_SECOND")
 TEST_MODE_FLAG = os.environ.get("HALT_ALERTS_TEST_MODE")
 TEST_MODE = bool(TEST_MODE_FLAG or TEST_DELAY_FIRST or TEST_DELAY_SECOND)
 USER_AGENT = "TradeHaltAlerts/1.0"
+X_API_BEARER_TOKEN = os.environ.get("X_API_BEARER_TOKEN")
+X_SEARCH_URL = "https://api.x.com/2/tweets/search/recent"
 
 
 def setup_logging() -> None:
@@ -352,12 +355,74 @@ def fetch_news_summary(ticker: str, company_name: Optional[str] = None) -> dict:
             headlines = [shorten(entry.get("title", "")) for entry in entries if entry.get("title")]
             summary = "; ".join(headlines) if headlines else "n/a"
             link = entries[0].get("link") or "n/a"
-            return {"link": link, "summary": summary}
+            return {"link": link, "summary": summary, "found": True}
         except Exception as exc:
             logging.warning("News fetch failed for %s: %s", query, exc)
             continue
 
-    return {"link": "n/a", "summary": "No recent Google News results"}
+    return {"link": "n/a", "summary": "No recent Google News results", "found": False}
+
+
+def fetch_latest_tweet(ticker: str, company_name: Optional[str] = None) -> Optional[str]:
+    if not X_API_BEARER_TOKEN:
+        return None
+
+    queries = []
+    if ticker:
+        queries.append(f"${ticker} OR cashtag:{ticker}")
+        queries.append(f"{ticker} stock")
+        queries.append(f"{ticker} halt")
+    if company_name:
+        queries.append(company_name)
+
+    headers = {"Authorization": f"Bearer {X_API_BEARER_TOKEN}"}
+    now = datetime.now(timezone.utc)
+    cutoff = now.timestamp() - (48 * 3600)
+
+    for query in queries:
+        try:
+            params = {
+                "query": query,
+                "max_results": 10,
+                "tweet.fields": "created_at,author_id",
+                "expansions": "author_id",
+                "user.fields": "username",
+            }
+            response = requests.get(X_SEARCH_URL, headers=headers, params=params, timeout=20)
+            if response.status_code == 429:
+                logging.warning("X API rate limit reached")
+                return None
+            response.raise_for_status()
+            payload = response.json()
+            data = payload.get("data", [])
+            users = {u["id"]: u.get("username") for u in payload.get("includes", {}).get("users", [])}
+            if not data:
+                continue
+            # find most recent within 48h
+            best = None
+            best_ts = 0
+            for tweet in data:
+                created_at = tweet.get("created_at")
+                if not created_at:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    continue
+                if ts < cutoff:
+                    continue
+                if ts > best_ts:
+                    best_ts = ts
+                    best = tweet
+            if not best:
+                continue
+            username = users.get(best.get("author_id"), "i")
+            return f"https://x.com/{username}/status/{best.get('id')}"
+        except Exception as exc:
+            logging.warning("X API search failed for %s: %s", query, exc)
+            continue
+
+    return None
 
 
 def send_notification(title: str, body: str) -> None:
@@ -380,6 +445,13 @@ def build_body(entry: dict, event_type: str) -> str:
     company_name = get_first(entry, ["name"], "")
 
     news = fetch_news_summary(ticker, company_name)
+    tweet_link = None
+    if not news.get("found"):
+        tweet_link = fetch_latest_tweet(ticker, company_name)
+        if tweet_link:
+            news = {"link": tweet_link, "summary": "Latest tweet", "found": True}
+        else:
+            news = {"link": "n/a", "summary": "No recent news or tweets", "found": False}
     market = fetch_market_data(ticker)
 
     lines = [
@@ -415,6 +487,13 @@ def build_scheduled_resume_body(pending: dict) -> str:
     company_name = pending.get("company_name", "")
 
     news = fetch_news_summary(ticker, company_name)
+    tweet_link = None
+    if not news.get("found"):
+        tweet_link = fetch_latest_tweet(ticker, company_name)
+        if tweet_link:
+            news = {"link": tweet_link, "summary": "Latest tweet", "found": True}
+        else:
+            news = {"link": "n/a", "summary": "No recent news or tweets", "found": False}
     market = fetch_market_data(ticker)
 
     lines = [
