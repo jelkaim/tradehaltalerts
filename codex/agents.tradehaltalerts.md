@@ -6,10 +6,16 @@ You are a senior macOS automation engineer and trading tooling developer.
 ## Mission
 Build and maintain a macOS tool that sends desktop notifications when a stock is halted and when it resumes, using NasdaqTrader Trade Halts RSS as the authoritative source.
 
-## Authoritative Source
-- Use RSS only, do not scrape HTML.
-- Feed: https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts
-- Poll at most once every 60 seconds.
+## Data Sources and Redundancy
+Primary source:
+- RSS: https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts
+
+Fallback sources:
+- NasdaqTrader Trade Halts page: https://www.nasdaqtrader.com/Trader.aspx?id=TradeHalts
+- NYSE CSV: https://www.nyse.com/api/trade-halts/current/download
+
+Use the RSS first, then the Nasdaq page, then the NYSE CSV if prior sources fail or return no events. Poll at most once every 60 seconds.
+Deduplicate events across all sources using a source independent event id.
 
 ## Notification Content
 Each notification must include:

@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 import argparse
+import csv
 import hashlib
+import html as html_lib
 import json
 import logging
 import os
+import re
 import subprocess
 import time
+from io import StringIO
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -13,6 +17,8 @@ import feedparser
 import requests
 
 TRADE_HALTS_RSS = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
+NASDAQ_TRADE_HALTS_PAGE = "https://www.nasdaqtrader.com/Trader.aspx?id=TradeHalts"
+NYSE_TRADE_HALTS_CSV = "https://www.nyse.com/api/trade-halts/current/download"
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
 FMP_QUOTE_URL = "https://financialmodelingprep.com/api/v3/quote/{ticker}?apikey={apikey}"
 
@@ -25,6 +31,7 @@ TEST_DELAY_FIRST = os.environ.get("HALT_ALERTS_TEST_DELAY_FIRST")
 TEST_DELAY_SECOND = os.environ.get("HALT_ALERTS_TEST_DELAY_SECOND")
 TEST_MODE_FLAG = os.environ.get("HALT_ALERTS_TEST_MODE")
 TEST_MODE = bool(TEST_MODE_FLAG or TEST_DELAY_FIRST or TEST_DELAY_SECOND)
+USER_AGENT = "TradeHaltAlerts/1.0"
 
 
 def setup_logging() -> None:
@@ -75,10 +82,24 @@ def save_state(state: dict) -> None:
         logging.warning("Failed to save state: %s", exc)
 
 
+def request_with_retries(url: str, timeout: int = 20, max_attempts: int = 3) -> bytes:
+    headers = {"User-Agent": USER_AGENT}
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.get(url, timeout=timeout, headers=headers)
+            response.raise_for_status()
+            return response.content
+        except Exception as exc:
+            last_error = exc
+            logging.warning("Fetch failed (%s/%s) for %s: %s", attempt, max_attempts, url, exc)
+            time.sleep(2 * attempt)
+    raise RuntimeError(f"Failed to fetch {url}: {last_error}")
+
+
 def fetch_rss(url: str) -> feedparser.FeedParserDict:
-    response = requests.get(url, timeout=20)
-    response.raise_for_status()
-    return feedparser.parse(response.content)
+    content = request_with_retries(url, timeout=20, max_attempts=3)
+    return feedparser.parse(content)
 
 
 def get_first(entry: dict, keys: List[str], default: str = "") -> str:
@@ -87,6 +108,48 @@ def get_first(entry: dict, keys: List[str], default: str = "") -> str:
         if value:
             return str(value).strip()
     return default
+
+
+def parse_html_table(html_text: str) -> List[dict]:
+    rows = re.findall(r"<tr[^>]*>.*?</tr>", html_text, flags=re.IGNORECASE | re.DOTALL)
+    header = []
+    parsed_rows = []
+    for row in rows:
+        cells = re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", row, flags=re.IGNORECASE | re.DOTALL)
+        if not cells:
+            continue
+        clean_cells = []
+        for cell in cells:
+            text = re.sub(r"<[^>]+>", "", cell)
+            text = html_lib.unescape(text).strip()
+            clean_cells.append(text)
+        if not header:
+            header = clean_cells
+            continue
+        if header and len(clean_cells) == len(header):
+            parsed_rows.append(dict(zip(header, clean_cells)))
+    return parsed_rows
+
+
+def normalize_row(row: dict) -> dict:
+    mapping = {
+        "Halt Date": "haltdate",
+        "Halt Time": "halttime",
+        "Issue Symbol": "symbol",
+        "Symbol": "symbol",
+        "Reason Code": "reasoncode",
+        "Reason": "reasoncode",
+        "Resume Date": "resumedate",
+        "Resume Time": "resumetime",
+        "NYSE Resume Time": "resumetime",
+        "Name": "name",
+        "Exchange": "exchange",
+    }
+    normalized = {}
+    for key, value in row.items():
+        if key in mapping:
+            normalized[mapping[key]] = value.strip() if isinstance(value, str) else value
+    return normalized
 
 
 def detect_event_type(entry: dict) -> str:
@@ -101,28 +164,102 @@ def detect_event_type(entry: dict) -> str:
 
 
 def event_id_for(entry: dict, event_type: str) -> str:
-    symbol = get_first(entry, ["symbol", "ticker"])
+    symbol = get_first(entry, ["symbol", "ticker", "title"]).upper()
     halt_date = get_first(entry, ["haltdate", "halt_date", "date"])
     halt_time = get_first(entry, ["halttime", "halt_time"])
     resume_date = get_first(entry, ["resumedate", "resume_date"])
     resume_time = get_first(entry, ["resumetime", "resume_time"])
-    reason = get_first(entry, ["reasoncode", "reason_code", "reason"])
 
-    parts = [event_type, symbol, halt_date, halt_time, resume_date, resume_time, reason]
+    parts = [event_type, symbol, halt_date, halt_time, resume_date, resume_time]
     compact = "|".join([part for part in parts if part])
     if compact:
         return compact
 
-    raw = "|".join(
-        [
-            get_first(entry, ["id", "guid"]),
-            get_first(entry, ["title"]),
-            get_first(entry, ["link"]),
-            get_first(entry, ["published", "updated"]),
-        ]
-    )
-    digest = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
+    # Fallback: build a stable digest from normalized fields excluding source
+    normalized = {}
+    for key, value in entry.items():
+        if key == "source":
+            continue
+        if value is None:
+            continue
+        normalized[key] = str(value).strip()
+    digest = hashlib.sha1(json.dumps(normalized, sort_keys=True).encode("utf-8", errors="ignore")).hexdigest()
     return f"fallback:{digest}"
+
+
+
+def fetch_rss_events() -> List[dict]:
+    feed = fetch_rss(TRADE_HALTS_RSS)
+    events = []
+    for entry in feed.entries:
+        data = {"source": "nasdaq_rss"}
+        data["symbol"] = entry.get("symbol") or entry.get("ticker") or entry.get("title") or "UNKNOWN"
+        summary = entry.get("summary", "")
+        if summary:
+            rows = parse_html_table(summary)
+            if rows:
+                data.update(normalize_row(rows[0]))
+        data["title"] = entry.get("title")
+        data["link"] = entry.get("link")
+        data["published"] = entry.get("published")
+        events.append(data)
+    return events
+
+
+def fetch_nasdaq_page_events() -> List[dict]:
+    content = request_with_retries(NASDAQ_TRADE_HALTS_PAGE, timeout=20, max_attempts=2)
+    html_text = content.decode("utf-8", errors="ignore")
+    rows = parse_html_table(html_text)
+    if not rows:
+        return []
+    events = []
+    for row in rows:
+        data = normalize_row(row)
+        if data:
+            data["source"] = "nasdaq_page"
+            events.append(data)
+    return events
+
+
+def fetch_nyse_events() -> List[dict]:
+    content = request_with_retries(NYSE_TRADE_HALTS_CSV, timeout=20, max_attempts=2)
+    text = content.decode("utf-8", errors="ignore")
+    reader = csv.DictReader(StringIO(text))
+    events = []
+    for row in reader:
+        data = normalize_row(row)
+        if data:
+            data["source"] = "nyse_csv"
+            events.append(data)
+    return events
+
+
+def fetch_trade_halts() -> List[dict]:
+    try:
+        events = fetch_rss_events()
+        if events:
+            return events
+        logging.warning("RSS returned no events, trying Nasdaq page")
+    except Exception as exc:
+        logging.warning("RSS fetch failed: %s", exc)
+
+    try:
+        events = fetch_nasdaq_page_events()
+        if events:
+            return events
+        logging.warning("Nasdaq page returned no events, trying NYSE CSV")
+    except Exception as exc:
+        logging.warning("Nasdaq page fetch failed: %s", exc)
+
+    try:
+        events = fetch_nyse_events()
+        if events:
+            return events
+        logging.warning("NYSE CSV returned no events")
+    except Exception as exc:
+        logging.warning("NYSE CSV fetch failed: %s", exc)
+
+    return []
 
 
 def format_compact(value: Optional[Union[float, int]]) -> str:
@@ -212,7 +349,7 @@ def send_notification(title: str, body: str) -> None:
 
 
 def build_body(entry: dict, event_type: str) -> str:
-    ticker = get_first(entry, ["symbol", "ticker"], "n/a")
+    ticker = get_first(entry, ["symbol", "ticker", "title"], "n/a")
     halt_date = get_first(entry, ["haltdate", "halt_date", "date"], "n/a")
     reason = get_first(entry, ["reasoncode", "reason_code", "reason"], "n/a")
 
@@ -349,8 +486,8 @@ def process_feed(state: dict) -> int:
 
     new_count += process_due_resumes(state)
 
-    feed = fetch_rss(TRADE_HALTS_RSS)
-    for entry in feed.entries:
+    entries = fetch_trade_halts()
+    for entry in entries:
         event_type = detect_event_type(entry)
         event_id = event_id_for(entry, event_type)
         if event_id in seen_ids:
