@@ -14,6 +14,10 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
+Optional, for clickable notifications:
+```bash
+brew install terminal-notifier
+```
 
 ## Run
 ```bash
@@ -63,6 +67,8 @@ Use `scripts/alerts_ctl.sh` to start or stop alerts.
 - On first run, existing halts are seeded as seen to avoid a notification flood. Only new halts after startup trigger alerts.
 - Google News enrichment tries multiple queries using the ticker and company name, and falls back to a clear \"No recent Google News results\" message if nothing is found.
 - If Google News has no results, the app can query the X API for a recent tweet within the last 48 hours using `X_API_BEARER_TOKEN`. If neither source has results, it shows \"No recent news or tweets\".
+- Each notification includes a \"More details\" link to a local details page served at `http://127.0.0.1:8787/alerts/<event_id>`. You can change the port with `HALT_ALERTS_DETAILS_PORT`.
+- If `terminal-notifier` is installed, clicking the notification opens the \"More details\" link. Otherwise it falls back to `osascript` with no click action.
 
 ## Test mode
 To speed up scheduled resume alerts, set these environment variables before starting the script or LaunchAgent.
@@ -75,7 +81,7 @@ Values are in seconds and only affect the scheduled resume notifications for the
 
 To send a single test notification without using the feed:
 ```bash
-python3 scripts/halt_alerts.py --test-notify
+python3 scripts/halt_alerts.py --test-notify --keep-alive-seconds 60
 ```
 
 Notifications include a sound. The current sound is `Glass`.
