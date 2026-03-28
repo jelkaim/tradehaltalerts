@@ -53,6 +53,44 @@ SEC_COMPANY_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.jso
 
 _SEC_TICKER_CIK_CACHE = {"data": {}, "timestamp": 0.0}
 
+HALT_CODE_DESCRIPTIONS = {
+    "T1": "Halt - News Pending. Trading is halted pending the release of material news.",
+    "T2": "Halt - News Released. The news has begun the dissemination process through a Regulation FD compliant method.",
+    "T3": "News and Resumption Times. The news has been fully disseminated through a Regulation FD compliant method or NASDAQ has determined conditions leading to a halt are no longer present. Two times will be displayed: time for quotations, then time for trading. Times are in HH:MM:SS.",
+    "T5": "Single Stock Trading Pause in Effect. Trading has been paused by NASDAQ due to a 10 percent or more price move in the security in a five minute period.",
+    "T6": "Halt - Extraordinary Market Activity. Trading is halted when extraordinary market activity is occurring and is likely to have a material effect on the market for that security.",
+    "T7": "Single Stock Trading Pause/Quotation-Only Period. Quotations have resumed for affected security, but trading remains paused.",
+    "T8": "Halt - Exchange-Traded-Fund (ETF). Trading is halted in an ETF due to factors such as trading ceasing in underlying securities or other unusual conditions.",
+    "T12": "Halt - Additional Information Requested by NASDAQ. Trading is halted pending receipt of additional information requested by NASDAQ.",
+    "H4": "Halt - Non-compliance. Trading is halted due to the company's non-compliance with NASDAQ listing requirements.",
+    "H9": "Halt - Not Current. Trading is halted because the company is not current in its required filings.",
+    "H10": "Halt - SEC Trading Suspension. The Securities and Exchange Commission has suspended trading in this stock.",
+    "H11": "Halt - Regulatory Concern. Trading is halted in conjunction with another exchange or market for regulatory reasons.",
+    "O1": "Operations Halt, Contact Market Operations.",
+    "IPO1": "IPO Issue not yet Trading.",
+    "IPOQ": "IPO security released for quotation.",
+    "IPOE": "IPO security - positioning window extension.",
+    "M1": "Corporate Action.",
+    "M2": "Quotation Not Available.",
+    "LUDP": "Volatility Trading Pause.",
+    "LUDS": "Volatility Trading Pause - Straddle Condition.",
+    "MWC1": "Market Wide Circuit Breaker Halt - Level 1.",
+    "MWC2": "Market Wide Circuit Breaker Halt - Level 2.",
+    "MWC3": "Market Wide Circuit Breaker Halt - Level 3.",
+    "MWC0": "Market Wide Circuit Breaker Halt - Carry over from previous day.",
+    "MWCQ": "Market Wide Circuit Breaker Resumption.",
+    "R4": "Qualifications Issues Reviewed/Resolved. Quotations and trading to resume.",
+    "R9": "Filing Requirements Satisfied/Resolved. Quotations and trading to resume.",
+    "C3": "Issuer News Not Forthcoming. Quotations and trading to resume.",
+    "C4": "Qualifications Halt ended, maintenance requirements met. Resume.",
+    "C9": "Qualifications Halt Concluded. Filings Met. Quotes and trades to resume.",
+    "C11": "Trade Halt Concluded By Other Regulatory Authority. Quotes and trades resume.",
+    "R1": "New Issue Available.",
+    "R2": "Issue Available.",
+    "M": "Volatility Trading Pause. Trading has been paused in an Exchange-Listed issue (Market Category Code = C).",
+    "D": "Security deletion from NASDAQ or CQS.",
+}
+
 
 def setup_logging() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -666,6 +704,9 @@ def render_alert_page(alert: dict) -> str:
             return f'<a href="{text}" target="_blank" rel="noopener noreferrer">{text}</a>'
         return text
 
+    reason_code = str(alert.get("reason", "")).strip().upper()
+    reason_desc = HALT_CODE_DESCRIPTIONS.get(reason_code)
+
     lines = [
         f"<h1>{html_lib.escape(alert.get('title', 'Alert'))}</h1>",
         "<ul>",
@@ -690,6 +731,8 @@ def render_alert_page(alert: dict) -> str:
         value = alert.get(key)
         if value:
             lines.append(f"<li><strong>{label}:</strong> {render_value(value)}</li>")
+    if reason_desc:
+        lines.append(f"<li><strong>Halt code description:</strong> {html_lib.escape(reason_desc)}</li>")
     tweet_link = fetch_latest_tweet(alert.get("ticker", ""), alert.get("company_name", ""))
     if tweet_link == "__x_unauthorized__":
         lines.append("<li><strong>Latest tweet:</strong> X API unauthorized. Check bearer token and plan.</li>")
