@@ -388,7 +388,7 @@ def fetch_latest_tweet(ticker: str, company_name: Optional[str] = None) -> Optio
 
     queries = []
     if ticker:
-        queries.append(f"${ticker} OR cashtag:{ticker}")
+        queries.append(f"${ticker} OR {ticker}")
         queries.append(f"{ticker} stock")
         queries.append(f"{ticker} halt")
     if company_name:
@@ -408,6 +408,12 @@ def fetch_latest_tweet(ticker: str, company_name: Optional[str] = None) -> Optio
                 "user.fields": "username",
             }
             response = requests.get(X_SEARCH_URL, headers=headers, params=params, timeout=20)
+            if response.status_code == 400:
+                logging.warning("X API bad request for query: %s", query)
+                continue
+            if response.status_code == 401:
+                logging.warning("X API unauthorized for query: %s", query)
+                return "__x_unauthorized__"
             if response.status_code == 429:
                 logging.warning("X API rate limit reached")
                 return None
@@ -553,12 +559,19 @@ def details_url(event_id: str) -> str:
 
 
 def render_alert_page(alert: dict) -> str:
+    def render_value(value: str) -> str:
+        text = html_lib.escape(str(value))
+        if str(value).startswith("http://") or str(value).startswith("https://"):
+            return f'<a href="{text}" target="_blank" rel="noopener noreferrer">{text}</a>'
+        return text
+
     lines = [
         f"<h1>{html_lib.escape(alert.get('title', 'Alert'))}</h1>",
         "<ul>",
     ]
     for key, label in [
         ("ticker", "Ticker"),
+        ("company_name", "Company"),
         ("halt_date", "Halt date"),
         ("halt_time", "Halt time"),
         ("resume_date", "Resume date"),
@@ -575,7 +588,17 @@ def render_alert_page(alert: dict) -> str:
     ]:
         value = alert.get(key)
         if value:
-            lines.append(f"<li><strong>{label}:</strong> {html_lib.escape(str(value))}</li>")
+            lines.append(f"<li><strong>{label}:</strong> {render_value(value)}</li>")
+    tweet_link = fetch_latest_tweet(alert.get("ticker", ""), alert.get("company_name", ""))
+    if tweet_link == "__x_unauthorized__":
+        lines.append("<li><strong>Latest tweet:</strong> X API unauthorized. Check bearer token and plan.</li>")
+    elif tweet_link:
+        lines.append(f"<li><strong>Latest tweet:</strong> {render_value(tweet_link)}</li>")
+    else:
+        if X_API_BEARER_TOKEN:
+            lines.append("<li><strong>Latest tweet:</strong> No recent tweet within 48 hours</li>")
+        else:
+            lines.append("<li><strong>Latest tweet:</strong> X_API_BEARER_TOKEN not set</li>")
     lines.append("</ul>")
     return "\n".join(lines)
 
@@ -666,6 +689,7 @@ def build_alert_record(entry: dict, event_type: str, news: dict, market: dict, e
         "event_id": event_id,
         "event_type": event_type,
         "ticker": get_first(entry, ["symbol", "ticker", "title"], "n/a"),
+        "company_name": get_first(entry, ["name"], ""),
         "halt_date": get_first(entry, ["haltdate", "halt_date", "date"], "n/a"),
         "halt_time": get_first(entry, ["halttime", "halt_time"], ""),
         "resume_date": get_first(entry, ["resumedate", "resume_date"], ""),
@@ -889,6 +913,7 @@ def main() -> None:
                 "event_id": "test-alert",
                 "event_type": "HALT",
                 "ticker": "TEST",
+                "company_name": "Test Company",
                 "halt_date": "2026-03-26",
                 "halt_time": "",
                 "resume_date": "",
