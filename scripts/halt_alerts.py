@@ -10,6 +10,7 @@ import re
 import subprocess
 import shutil
 import time
+from datetime import timedelta
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import StringIO
@@ -45,13 +46,26 @@ TERMINAL_NOTIFIER_SENDER = os.environ.get("TERMINAL_NOTIFIER_SENDER")
 TERMINAL_NOTIFIER_ACTIVATE = os.environ.get("TERMINAL_NOTIFIER_ACTIVATE")
 OPEN_DETAILS = os.environ.get("HALT_ALERTS_OPEN_DETAILS", "").lower() == "auto"
 ALPHAVANTAGE_API_KEY = os.environ.get("ALPHAVANTAGE_API_KEY")
+TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
 SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT", "TradeHaltAlerts/1.0")
+INTRADAY_LOOKBACK_MINUTES = int(os.environ.get("HALT_ALERTS_INTRADAY_LOOKBACK_MINUTES", "5"))
 
 ALPHAVANTAGE_QUOTE_URL = "https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker}&apikey={apikey}"
+ALPHAVANTAGE_INTRADAY_URL = (
+    "https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol={ticker}"
+    "&interval=1min&outputsize=compact&apikey={apikey}"
+)
+TWELVEDATA_INTRADAY_URL = (
+    "https://api.twelvedata.com/time_series?symbol={ticker}&interval=1min&outputsize=30&apikey={apikey}"
+)
 SEC_TICKER_CIK_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_COMPANY_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 
 _SEC_TICKER_CIK_CACHE = {"data": {}, "timestamp": 0.0}
+_AV_INTRADAY_CACHE = {}
+_TD_INTRADAY_CACHE = {}
+
+LULD_CODES = {"LUDP", "LUDS", "M"}
 
 HALT_CODE_DESCRIPTIONS = {
     "T1": "Halt - News Pending. Trading is halted pending the release of material news.",
@@ -111,17 +125,32 @@ def setup_logging() -> None:
 
 def load_state() -> dict:
     if not STATE_PATH.exists():
-        return {"seen_ids": [], "pending_resumes": [], "halt_counts": {}, "last_poll": 0, "recent_alerts": []}
+        return {
+            "seen_ids": [],
+            "pending_resumes": [],
+            "halt_counts": {},
+            "last_poll": 0,
+            "recent_alerts": [],
+            "paused": False,
+        }
     try:
         with STATE_PATH.open("r", encoding="utf-8") as handle:
             data = json.load(handle)
         if not isinstance(data, dict):
-            return {"seen_ids": [], "pending_resumes": [], "halt_counts": {}, "last_poll": 0, "recent_alerts": []}
+            return {
+                "seen_ids": [],
+                "pending_resumes": [],
+                "halt_counts": {},
+                "last_poll": 0,
+                "recent_alerts": [],
+                "paused": False,
+            }
         data.setdefault("seen_ids", [])
         data.setdefault("pending_resumes", [])
         data.setdefault("halt_counts", {})
         data.setdefault("last_poll", 0)
         data.setdefault("recent_alerts", [])
+        data.setdefault("paused", False)
         if not isinstance(data["seen_ids"], list):
             data["seen_ids"] = []
         if not isinstance(data["pending_resumes"], list):
@@ -130,10 +159,19 @@ def load_state() -> dict:
             data["halt_counts"] = {}
         if not isinstance(data["recent_alerts"], list):
             data["recent_alerts"] = []
+        if not isinstance(data["paused"], bool):
+            data["paused"] = False
         return data
     except Exception as exc:
         logging.warning("Failed to load state, starting fresh: %s", exc)
-        return {"seen_ids": [], "pending_resumes": [], "halt_counts": {}, "last_poll": 0, "recent_alerts": []}
+        return {
+            "seen_ids": [],
+            "pending_resumes": [],
+            "halt_counts": {},
+            "last_poll": 0,
+            "recent_alerts": [],
+            "paused": False,
+        }
 
 
 def save_state(state: dict) -> None:
@@ -171,9 +209,9 @@ def fetch_rss(url: str) -> feedparser.FeedParserDict:
     return feedparser.parse(content)
 
 
-def fetch_alphavantage_price(ticker: str) -> Optional[float]:
+def fetch_alphavantage_quote(ticker: str) -> dict:
     if not ALPHAVANTAGE_API_KEY:
-        return None
+        return {}
     try:
         url = ALPHAVANTAGE_QUOTE_URL.format(ticker=ticker, apikey=ALPHAVANTAGE_API_KEY)
         response = requests.get(url, timeout=20)
@@ -181,12 +219,84 @@ def fetch_alphavantage_price(ticker: str) -> Optional[float]:
         data = response.json()
         quote = data.get("Global Quote", {})
         price_str = quote.get("05. price") or quote.get("05. price ")
-        if not price_str:
-            return None
-        return float(price_str)
+        prev_close_str = quote.get("08. previous close") or quote.get("08. previous close ")
+        result = {}
+        if price_str:
+            result["price"] = float(price_str)
+        if prev_close_str:
+            result["prev_close"] = float(prev_close_str)
+        return result
     except Exception as exc:
         logging.warning("Alpha Vantage price failed for %s: %s", ticker, exc)
-        return None
+        return {}
+
+
+def fetch_alphavantage_intraday(ticker: str) -> list:
+    if not ALPHAVANTAGE_API_KEY:
+        return []
+    now = time.time()
+    cached = _AV_INTRADAY_CACHE.get(ticker)
+    if cached and now - cached.get("timestamp", 0) < 55:
+        return cached.get("series", [])
+    try:
+        url = ALPHAVANTAGE_INTRADAY_URL.format(ticker=ticker, apikey=ALPHAVANTAGE_API_KEY)
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+        series = data.get("Time Series (1min)", {})
+        points = []
+        for ts, values in series.items():
+            close_str = values.get("4. close")
+            if not close_str:
+                continue
+            try:
+                dt = datetime.fromisoformat(ts)
+                close = float(close_str)
+            except ValueError:
+                continue
+            points.append((dt, close))
+        points.sort(key=lambda x: x[0], reverse=True)
+        _AV_INTRADAY_CACHE[ticker] = {"timestamp": now, "series": points}
+        return points
+    except Exception as exc:
+        logging.warning("Alpha Vantage intraday failed for %s: %s", ticker, exc)
+        return []
+
+
+def fetch_twelvedata_intraday(ticker: str) -> list:
+    if not TWELVEDATA_API_KEY:
+        return []
+    now = time.time()
+    cached = _TD_INTRADAY_CACHE.get(ticker)
+    if cached and now - cached.get("timestamp", 0) < 55:
+        return cached.get("series", [])
+    try:
+        url = TWELVEDATA_INTRADAY_URL.format(ticker=ticker, apikey=TWELVEDATA_API_KEY)
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("status") == "error":
+            logging.warning("Twelve Data intraday error for %s: %s", ticker, data.get("message"))
+            return []
+        values = data.get("values", [])
+        points = []
+        for item in values:
+            dt_str = item.get("datetime")
+            close_str = item.get("close")
+            if not dt_str or not close_str:
+                continue
+            try:
+                dt = datetime.fromisoformat(dt_str)
+                close = float(close_str)
+            except ValueError:
+                continue
+            points.append((dt, close))
+        points.sort(key=lambda x: x[0], reverse=True)
+        _TD_INTRADAY_CACHE[ticker] = {"timestamp": now, "series": points}
+        return points
+    except Exception as exc:
+        logging.warning("Twelve Data intraday failed for %s: %s", ticker, exc)
+        return []
 
 
 def fetch_sec_ticker_cik_map() -> dict:
@@ -320,6 +430,37 @@ def parse_halt_datetime(entry: dict) -> Optional[float]:
         except ValueError:
             continue
     return None
+
+
+def compute_halt_direction(reason_code: str, market: dict) -> str:
+    code = reason_code.strip().upper()
+    if code not in LULD_CODES:
+        return ""
+    lookback = max(2, min(5, INTRADAY_LOOKBACK_MINUTES))
+    ticker = market.get("ticker", "")
+    series = fetch_twelvedata_intraday(ticker) if ticker else []
+    if not series and ticker:
+        series = fetch_alphavantage_intraday(ticker)
+    if series:
+        latest_dt, latest_close = series[0]
+        target_dt = latest_dt - timedelta(minutes=lookback)
+        past_close = None
+        for dt, close in series:
+            if dt <= target_dt:
+                past_close = close
+                break
+        if past_close is not None:
+            return "Up" if latest_close >= past_close else "Down"
+
+    prev_close = market.get("prev_close")
+    price_str = market.get("price", "n/a")
+    try:
+        price = float(price_str.replace("$", "")) if isinstance(price_str, str) else float(price_str)
+    except (TypeError, ValueError, AttributeError):
+        price = None
+    if prev_close is None or price is None:
+        return "n/a"
+    return "Up" if price >= prev_close else "Down"
 
 
 def detect_event_type(entry: dict) -> str:
@@ -477,13 +618,17 @@ def fetch_market_data(ticker: str) -> dict:
         except Exception as exc:
             logging.warning("FMP market data failed for %s: %s", ticker, exc)
 
-    price = fetch_alphavantage_price(ticker)
+    av_quote = fetch_alphavantage_quote(ticker)
+    price = av_quote.get("price")
+    prev_close = av_quote.get("prev_close")
     shares = fetch_sec_shares_outstanding(ticker)
     market_cap = price * shares if price is not None and shares is not None else None
     return {
         "price": format_price(price),
         "market_cap": format_compact(market_cap),
         "float": "n/a",
+        "prev_close": prev_close,
+        "ticker": ticker,
     }
 
 
@@ -676,6 +821,8 @@ def build_body(
         f"Market cap: {market['market_cap']}",
         f"Float: {market['float']}",
     ]
+    if entry.get("halt_direction"):
+        lines.insert(3, f"Halt direction: {entry.get('halt_direction')}")
     if more_details:
         lines.append(f"More details: {more_details}")
     if TEST_MODE:
@@ -719,6 +866,7 @@ def render_alert_page(alert: dict) -> str:
         ("resume_date", "Resume date"),
         ("resume_time", "Resume time"),
         ("reason", "Reason"),
+        ("halt_direction", "Halt direction"),
         ("news_link", "News link"),
         ("news_summary", "News summary"),
         ("price", "Price"),
@@ -839,6 +987,7 @@ def build_alert_record(entry: dict, event_type: str, news: dict, market: dict, e
         "resume_date": get_first(entry, ["resumedate", "resume_date"], ""),
         "resume_time": get_first(entry, ["resumetime", "resume_time"], ""),
         "reason": get_first(entry, ["reasoncode", "reason_code", "reason"], "n/a"),
+        "halt_direction": entry.get("halt_direction", ""),
         "news_link": news.get("link", "n/a"),
         "news_summary": news.get("summary", "n/a"),
         "price": market.get("price", "n/a"),
@@ -904,12 +1053,16 @@ def process_due_resumes(state: dict) -> int:
     pending_list = state.get("pending_resumes", [])
     remaining = []
     sent = 0
+    paused = state.get("paused", False)
 
     for pending in pending_list:
         due_at = pending.get("due_at", 0)
         if due_at and due_at <= now:
             ticker = pending.get("ticker", "UNKNOWN")
             event_id = pending.get("event_id") or f"scheduled:{ticker}:{int(due_at)}"
+            if paused:
+                state.setdefault("halt_counts", {})[ticker] = 0
+                continue
             title = f"RESUME: {ticker}"
             if TEST_MODE:
                 title = f"TEST {title}"
@@ -949,6 +1102,7 @@ def process_due_resumes(state: dict) -> int:
 def process_feed(state: dict) -> int:
     seen_ids = set(state.get("seen_ids", []))
     new_count = 0
+    paused = state.get("paused", False)
 
     new_count += process_due_resumes(state)
 
@@ -976,12 +1130,20 @@ def process_feed(state: dict) -> int:
             seen_ids.add(event_id)
             continue
 
+        if paused:
+            seen_ids.add(event_id)
+            continue
+
         ticker = get_first(entry, ["symbol", "ticker", "title"], "UNKNOWN")
         title = f"{event_type}: {ticker}"
         if TEST_MODE:
             title = f"TEST {title}"
         more_details = details_url(event_id)
         news, market = get_enrichment(ticker, get_first(entry, ["name"], ""))
+        reason_code = get_first(entry, ["reasoncode", "reason_code", "reason"], "")
+        halt_direction = compute_halt_direction(reason_code, market)
+        if halt_direction:
+            entry["halt_direction"] = halt_direction
         body = build_body(entry, event_type, more_details=more_details, news=news, market=market)
 
         send_notification(title, body, open_url=more_details)
