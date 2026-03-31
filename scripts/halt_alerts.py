@@ -60,10 +60,12 @@ TWELVEDATA_INTRADAY_URL = (
 )
 SEC_TICKER_CIK_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_COMPANY_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+FINRA_SHORT_INTEREST_URL = "https://api.finra.org/data/group/otcMarket/name/EquityShortInterest"
 
 _SEC_TICKER_CIK_CACHE = {"data": {}, "timestamp": 0.0}
 _AV_INTRADAY_CACHE = {}
 _TD_INTRADAY_CACHE = {}
+_FINRA_SI_CACHE = {}
 
 LULD_CODES = {"LUDP", "LUDS", "M"}
 
@@ -368,6 +370,44 @@ def fetch_sec_shares_outstanding(ticker: str) -> Optional[float]:
         return None
 
 
+def fetch_finra_short_interest(ticker: str) -> dict:
+    now = time.time()
+    cached = _FINRA_SI_CACHE.get(ticker)
+    if cached and now - cached.get("timestamp", 0) < 12 * 3600:
+        return cached.get("data", {})
+    try:
+        payload = {
+            "compareFilters": [
+                {"compareType": "EQUAL", "fieldName": "issueSymbolIdentifier", "fieldValue": ticker.upper()}
+            ],
+            "limit": 50,
+        }
+        headers = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": USER_AGENT}
+        response = requests.post(FINRA_SHORT_INTEREST_URL, json=payload, headers=headers, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, list) or not data:
+            return {}
+        # pick latest by settlementDate
+        def parse_date(item):
+            try:
+                return datetime.fromisoformat(item.get("settlementDate", ""))
+            except ValueError:
+                return datetime.min
+
+        latest = max(data, key=parse_date)
+        result = {
+            "short_interest_shares": latest.get("currentShortShareNumber"),
+            "short_interest_date": latest.get("settlementDate"),
+            "days_to_cover": latest.get("daysToCoverNumber"),
+        }
+        _FINRA_SI_CACHE[ticker] = {"timestamp": now, "data": result}
+        return result
+    except Exception as exc:
+        logging.warning("FINRA short interest failed for %s: %s", ticker, exc)
+        return {}
+
+
 def get_first(entry: dict, keys: List[str], default: str = "") -> str:
     for key in keys:
         value = entry.get(key)
@@ -623,12 +663,23 @@ def fetch_market_data(ticker: str) -> dict:
     prev_close = av_quote.get("prev_close")
     shares = fetch_sec_shares_outstanding(ticker)
     market_cap = price * shares if price is not None and shares is not None else None
+    overnight_change = None
+    if prev_close and price is not None:
+        try:
+            overnight_change = (price - prev_close) / prev_close
+        except Exception:
+            overnight_change = None
+    short_interest = fetch_finra_short_interest(ticker)
     return {
         "price": format_price(price),
         "market_cap": format_compact(market_cap),
         "float": "n/a",
         "prev_close": prev_close,
         "ticker": ticker,
+        "overnight_change": overnight_change,
+        "short_interest_shares": short_interest.get("short_interest_shares"),
+        "short_interest_date": short_interest.get("short_interest_date"),
+        "days_to_cover": short_interest.get("days_to_cover"),
     }
 
 
@@ -821,6 +872,15 @@ def build_body(
         f"Market cap: {market['market_cap']}",
         f"Float: {market['float']}",
     ]
+    if market.get("overnight_change") is not None:
+        pct = market["overnight_change"] * 100
+        lines.append(f"Overnight change: {pct:+.2f}%")
+    if market.get("short_interest_shares"):
+        lines.append(f"Short interest shares: {market.get('short_interest_shares')}")
+    if market.get("short_interest_date"):
+        lines.append(f"Short interest date: {market.get('short_interest_date')}")
+    if market.get("days_to_cover") is not None:
+        lines.append(f"Days to cover: {market.get('days_to_cover')}")
     if entry.get("halt_direction"):
         lines.insert(3, f"Halt direction: {entry.get('halt_direction')}")
     if more_details:
@@ -872,13 +932,24 @@ def render_alert_page(alert: dict) -> str:
         ("price", "Price"),
         ("market_cap", "Market cap"),
         ("float", "Float"),
+        ("overnight_change", "Overnight change"),
+        ("short_interest_shares", "Short interest shares"),
+        ("short_interest_date", "Short interest date"),
+        ("days_to_cover", "Days to cover"),
         ("source", "Source"),
         ("event_type", "Event type"),
         ("timestamp", "Timestamp"),
     ]:
         value = alert.get(key)
         if value:
-            lines.append(f"<li><strong>{label}:</strong> {render_value(value)}</li>")
+            if key == "overnight_change":
+                try:
+                    pct = float(value) * 100
+                    lines.append(f"<li><strong>{label}:</strong> {pct:+.2f}%</li>")
+                except Exception:
+                    lines.append(f"<li><strong>{label}:</strong> {render_value(value)}</li>")
+            else:
+                lines.append(f"<li><strong>{label}:</strong> {render_value(value)}</li>")
     if reason_desc:
         lines.append(f"<li><strong>Halt code description:</strong> {html_lib.escape(reason_desc)}</li>")
     tweet_link = fetch_latest_tweet(alert.get("ticker", ""), alert.get("company_name", ""))
@@ -993,6 +1064,10 @@ def build_alert_record(entry: dict, event_type: str, news: dict, market: dict, e
         "price": market.get("price", "n/a"),
         "market_cap": market.get("market_cap", "n/a"),
         "float": market.get("float", "n/a"),
+        "overnight_change": market.get("overnight_change"),
+        "short_interest_shares": market.get("short_interest_shares"),
+        "short_interest_date": market.get("short_interest_date"),
+        "days_to_cover": market.get("days_to_cover"),
         "source": source,
         "title": f"{event_type}: {get_first(entry, ['symbol', 'ticker', 'title'], 'n/a')}",
         "timestamp": datetime.now(timezone.utc).isoformat(),

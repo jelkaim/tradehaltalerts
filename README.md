@@ -69,6 +69,7 @@ Use `scripts/alerts_ctl.sh` to start or stop alerts.
 - If the FMP API key is missing or the API fails, price, market cap, and float show `n/a`.
 - Optional fallback: set `ALPHAVANTAGE_API_KEY` to fetch price from Alpha Vantage and compute market cap using SEC shares outstanding. Float remains `n/a`.
 - For SEC requests, you can set `SEC_USER_AGENT` to a descriptive value with contact info.
+- Short interest is pulled from FINRA's Equity Short Interest dataset and is updated on the FINRA schedule (typically twice per month).
 - For LULD halts (`LUDP`, `LUDS`, `M`), the app can infer halt direction using Twelve Data 1 minute intraday data. Alpha Vantage intraday is a fallback if available. Set `HALT_ALERTS_INTRADAY_LOOKBACK_MINUTES` (2 to 5, default 5).
 - Trade halts are fetched from NasdaqTrader RSS first, then the NasdaqTrader Trade Halts page, then the NYSE CSV endpoint as a fallback.
 - Events are deduplicated across all sources using a source independent event id.
