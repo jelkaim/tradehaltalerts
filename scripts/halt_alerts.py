@@ -49,6 +49,10 @@ ALPHAVANTAGE_API_KEY = os.environ.get("ALPHAVANTAGE_API_KEY")
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
 SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT", "TradeHaltAlerts/1.0")
 INTRADAY_LOOKBACK_MINUTES = int(os.environ.get("HALT_ALERTS_INTRADAY_LOOKBACK_MINUTES", "5"))
+AI_CATALYST_ENABLED = os.environ.get("HALT_ALERTS_AI_CATALYST", "").lower() == "1"
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 
 ALPHAVANTAGE_QUOTE_URL = "https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker}&apikey={apikey}"
 ALPHAVANTAGE_INTRADAY_URL = (
@@ -134,6 +138,7 @@ def load_state() -> dict:
             "last_poll": 0,
             "recent_alerts": [],
             "paused": False,
+            "catalyst_cache": {},
         }
     try:
         with STATE_PATH.open("r", encoding="utf-8") as handle:
@@ -146,6 +151,7 @@ def load_state() -> dict:
                 "last_poll": 0,
                 "recent_alerts": [],
                 "paused": False,
+                "catalyst_cache": {},
             }
         data.setdefault("seen_ids", [])
         data.setdefault("pending_resumes", [])
@@ -153,6 +159,7 @@ def load_state() -> dict:
         data.setdefault("last_poll", 0)
         data.setdefault("recent_alerts", [])
         data.setdefault("paused", False)
+        data.setdefault("catalyst_cache", {})
         if not isinstance(data["seen_ids"], list):
             data["seen_ids"] = []
         if not isinstance(data["pending_resumes"], list):
@@ -163,6 +170,8 @@ def load_state() -> dict:
             data["recent_alerts"] = []
         if not isinstance(data["paused"], bool):
             data["paused"] = False
+        if not isinstance(data["catalyst_cache"], dict):
+            data["catalyst_cache"] = {}
         return data
     except Exception as exc:
         logging.warning("Failed to load state, starting fresh: %s", exc)
@@ -173,6 +182,7 @@ def load_state() -> dict:
             "last_poll": 0,
             "recent_alerts": [],
             "paused": False,
+            "catalyst_cache": {},
         }
 
 
@@ -385,7 +395,12 @@ def fetch_finra_short_interest(ticker: str) -> dict:
         headers = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": USER_AGENT}
         response = requests.post(FINRA_SHORT_INTEREST_URL, json=payload, headers=headers, timeout=20)
         response.raise_for_status()
-        data = response.json()
+        try:
+            data = response.json()
+        except Exception:
+            snippet = response.text[:200].replace("\n", " ")
+            logging.warning("FINRA short interest non-JSON response for %s: %s", ticker, snippet)
+            return {}
         if not isinstance(data, list) or not data:
             return {}
         # pick latest by settlementDate
@@ -407,6 +422,55 @@ def fetch_finra_short_interest(ticker: str) -> dict:
         logging.warning("FINRA short interest failed for %s: %s", ticker, exc)
         return {}
 
+
+def fetch_ai_catalyst(state: dict, event_id: str, payload: dict) -> dict:
+    if not AI_CATALYST_ENABLED or not OPENAI_API_KEY:
+        return {}
+    cache = state.setdefault("catalyst_cache", {})
+    cached = cache.get(event_id)
+    if isinstance(cached, dict) and cached.get("label"):
+        return cached
+
+    system = (
+        "You are a concise financial news classifier. "
+        "Given headlines and context, label catalyst strength as strong, moderate, weak, or noise. "
+        "Return strict JSON with keys: label, confidence, rationale."
+    )
+    user = json.dumps(payload, ensure_ascii=False)
+    body = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "max_output_tokens": 200,
+        "temperature": 0.2,
+    }
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    try:
+        response = requests.post(OPENAI_RESPONSES_URL, headers=headers, json=body, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+        text = ""
+        for item in data.get("output", []):
+            if item.get("type") == "message":
+                parts = item.get("content", [])
+                for part in parts:
+                    if part.get("type") == "output_text":
+                        text += part.get("text", "")
+        result = json.loads(text) if text else {}
+        label = str(result.get("label", "")).strip().lower()
+        confidence = float(result.get("confidence", 0))
+        rationale = str(result.get("rationale", "")).strip()
+        if label not in {"strong", "moderate", "weak", "noise"}:
+            return {}
+        out = {"label": label, "confidence": confidence, "rationale": rationale}
+        cache[event_id] = out
+        save_state(state)
+        return out
+    except Exception as exc:
+        logging.warning("AI catalyst failed: %s", exc)
+        return {}
 
 def get_first(entry: dict, keys: List[str], default: str = "") -> str:
     for key in keys:
@@ -872,6 +936,17 @@ def build_body(
         f"Market cap: {market['market_cap']}",
         f"Float: {market['float']}",
     ]
+    if entry.get("catalyst_label"):
+        label = entry.get("catalyst_label")
+        conf = entry.get("catalyst_confidence")
+        if conf != "":
+            try:
+                conf_pct = float(conf) * 100
+                lines.insert(3, f"Catalyst: {label} ({conf_pct:.0f}%)")
+            except Exception:
+                lines.insert(3, f"Catalyst: {label}")
+        else:
+            lines.insert(3, f"Catalyst: {label}")
     if market.get("overnight_change") is not None:
         pct = market["overnight_change"] * 100
         lines.append(f"Overnight change: {pct:+.2f}%")
@@ -936,6 +1011,9 @@ def render_alert_page(alert: dict) -> str:
         ("short_interest_shares", "Short interest shares"),
         ("short_interest_date", "Short interest date"),
         ("days_to_cover", "Days to cover"),
+        ("catalyst_label", "Catalyst"),
+        ("catalyst_confidence", "Catalyst confidence"),
+        ("catalyst_rationale", "Catalyst rationale"),
         ("source", "Source"),
         ("event_type", "Event type"),
         ("timestamp", "Timestamp"),
@@ -946,6 +1024,12 @@ def render_alert_page(alert: dict) -> str:
                 try:
                     pct = float(value) * 100
                     lines.append(f"<li><strong>{label}:</strong> {pct:+.2f}%</li>")
+                except Exception:
+                    lines.append(f"<li><strong>{label}:</strong> {render_value(value)}</li>")
+            elif key == "catalyst_confidence":
+                try:
+                    pct = float(value) * 100
+                    lines.append(f"<li><strong>{label}:</strong> {pct:.0f}%</li>")
                 except Exception:
                     lines.append(f"<li><strong>{label}:</strong> {render_value(value)}</li>")
             else:
@@ -1068,6 +1152,9 @@ def build_alert_record(entry: dict, event_type: str, news: dict, market: dict, e
         "short_interest_shares": market.get("short_interest_shares"),
         "short_interest_date": market.get("short_interest_date"),
         "days_to_cover": market.get("days_to_cover"),
+        "catalyst_label": entry.get("catalyst_label", ""),
+        "catalyst_confidence": entry.get("catalyst_confidence", ""),
+        "catalyst_rationale": entry.get("catalyst_rationale", ""),
         "source": source,
         "title": f"{event_type}: {get_first(entry, ['symbol', 'ticker', 'title'], 'n/a')}",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1219,6 +1306,20 @@ def process_feed(state: dict) -> int:
         halt_direction = compute_halt_direction(reason_code, market)
         if halt_direction:
             entry["halt_direction"] = halt_direction
+        if news.get("found"):
+            payload = {
+                "ticker": ticker,
+                "company_name": get_first(entry, ["name"], ""),
+                "reason_code": reason_code,
+                "halt_direction": entry.get("halt_direction", ""),
+                "news_summary": news.get("summary", ""),
+                "news_link": news.get("link", ""),
+            }
+            catalyst = fetch_ai_catalyst(state, event_id, payload)
+            if catalyst:
+                entry["catalyst_label"] = catalyst.get("label", "")
+                entry["catalyst_confidence"] = catalyst.get("confidence", "")
+                entry["catalyst_rationale"] = catalyst.get("rationale", "")
         body = build_body(entry, event_type, more_details=more_details, news=news, market=market)
 
         send_notification(title, body, open_url=more_details)
@@ -1305,6 +1406,9 @@ def main() -> None:
                 "price": "n/a",
                 "market_cap": "n/a",
                 "float": "n/a",
+                "catalyst_label": "noise",
+                "catalyst_confidence": 0.0,
+                "catalyst_rationale": "Test alert",
                 "source": "test",
                 "title": title,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
