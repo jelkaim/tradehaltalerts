@@ -12,6 +12,7 @@ import shutil
 import time
 from datetime import timedelta
 from datetime import datetime, timezone
+from datetime import date as date_cls
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import StringIO
 from pathlib import Path
@@ -42,17 +43,19 @@ X_API_BEARER_TOKEN = os.environ.get("X_API_BEARER_TOKEN")
 X_SEARCH_URL = "https://api.x.com/2/tweets/search/recent"
 DETAILS_PORT = int(os.environ.get("HALT_ALERTS_DETAILS_PORT", "8787"))
 DETAILS_HOST = "127.0.0.1"
+DETAILS_AVAILABLE = False
 TERMINAL_NOTIFIER_SENDER = os.environ.get("TERMINAL_NOTIFIER_SENDER")
 TERMINAL_NOTIFIER_ACTIVATE = os.environ.get("TERMINAL_NOTIFIER_ACTIVATE")
 OPEN_DETAILS = os.environ.get("HALT_ALERTS_OPEN_DETAILS", "").lower() == "auto"
 ALPHAVANTAGE_API_KEY = os.environ.get("ALPHAVANTAGE_API_KEY")
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
-SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT", "TradeHaltAlerts/1.0")
+SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT")
 INTRADAY_LOOKBACK_MINUTES = int(os.environ.get("HALT_ALERTS_INTRADAY_LOOKBACK_MINUTES", "5"))
 AI_CATALYST_ENABLED = os.environ.get("HALT_ALERTS_AI_CATALYST", "").lower() == "1"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+FINRA_SHORT_INTEREST_DATE = os.environ.get("FINRA_SHORT_INTEREST_DATE")
 
 ALPHAVANTAGE_QUOTE_URL = "https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker}&apikey={apikey}"
 ALPHAVANTAGE_INTRADAY_URL = (
@@ -62,14 +65,21 @@ ALPHAVANTAGE_INTRADAY_URL = (
 TWELVEDATA_INTRADAY_URL = (
     "https://api.twelvedata.com/time_series?symbol={ticker}&interval=1min&outputsize=30&apikey={apikey}"
 )
+TWELVEDATA_QUOTE_URL = "https://api.twelvedata.com/quote?symbol={ticker}&apikey={apikey}"
 SEC_TICKER_CIK_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_COMPANY_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-FINRA_SHORT_INTEREST_URL = "https://api.finra.org/data/group/otcMarket/name/EquityShortInterest"
+FINRA_SHORT_INTEREST_URL = "https://api.finra.org/data/group/otcMarket/name/ConsolidatedShortInterest"
+FINRA_PARTITIONS_URL = "https://api.finra.org/partitions/group/otcMarket/name/ConsolidatedShortInterest"
+FINRA_SCHEDULE_URL = "https://www.finra.org/filing-reporting/regulatory-filing-systems/short-interest"
 
 _SEC_TICKER_CIK_CACHE = {"data": {}, "timestamp": 0.0}
+_SEC_COMPANY_FACTS_CACHE = {"data": {}, "timestamp": 0.0}
+_SEC_UA_WARNED = False
 _AV_INTRADAY_CACHE = {}
 _TD_INTRADAY_CACHE = {}
 _FINRA_SI_CACHE = {}
+_FINRA_CALENDAR_CACHE = {"date": None, "timestamp": 0.0}
+_FINRA_PARTITION_CACHE = {"dates": [], "timestamp": 0.0}
 
 LULD_CODES = {"LUDP", "LUDS", "M"}
 
@@ -127,6 +137,16 @@ def setup_logging() -> None:
 
     logger.addHandler(file_handler)
     logger.addHandler(stream_handler)
+
+
+def sec_headers() -> Optional[dict]:
+    global _SEC_UA_WARNED
+    if not SEC_USER_AGENT:
+        if not _SEC_UA_WARNED:
+            logging.warning("SEC_USER_AGENT not set. SEC endpoints will be skipped.")
+            _SEC_UA_WARNED = True
+        return None
+    return {"User-Agent": SEC_USER_AGENT}
 
 
 def load_state() -> dict:
@@ -196,6 +216,9 @@ def save_state(state: dict) -> None:
 
 def record_alert(state: dict, alert: dict) -> None:
     alerts = state.setdefault("recent_alerts", [])
+    event_id = alert.get("event_id")
+    if event_id:
+        alerts[:] = [a for a in alerts if a.get("event_id") != event_id]
     alerts.append(alert)
     if len(alerts) > 200:
         del alerts[:-200]
@@ -240,6 +263,29 @@ def fetch_alphavantage_quote(ticker: str) -> dict:
         return result
     except Exception as exc:
         logging.warning("Alpha Vantage price failed for %s: %s", ticker, exc)
+        return {}
+
+
+def fetch_twelvedata_quote(ticker: str) -> dict:
+    if not TWELVEDATA_API_KEY:
+        return {}
+    try:
+        url = TWELVEDATA_QUOTE_URL.format(ticker=ticker, apikey=TWELVEDATA_API_KEY)
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("status") == "error":
+            raise ValueError(data.get("message") or "twelvedata error")
+        result = {}
+        close_str = data.get("close")
+        prev_close_str = data.get("previous_close")
+        if close_str:
+            result["price"] = float(close_str)
+        if prev_close_str:
+            result["prev_close"] = float(prev_close_str)
+        return result
+    except Exception as exc:
+        logging.warning("Twelve Data quote failed for %s: %s", ticker, exc)
         return {}
 
 
@@ -317,7 +363,10 @@ def fetch_sec_ticker_cik_map() -> dict:
     if cached and now - _SEC_TICKER_CIK_CACHE.get("timestamp", 0) < 24 * 3600:
         return cached
     try:
-        response = requests.get(SEC_TICKER_CIK_URL, headers={"User-Agent": SEC_USER_AGENT}, timeout=20)
+        headers = sec_headers()
+        if not headers:
+            return cached
+        response = requests.get(SEC_TICKER_CIK_URL, headers=headers, timeout=20)
         response.raise_for_status()
         data = response.json()
         mapping = {}
@@ -352,16 +401,38 @@ def select_latest_fact(items: list) -> Optional[float]:
     return best_val
 
 
-def fetch_sec_shares_outstanding(ticker: str) -> Optional[float]:
+def fetch_sec_company_facts(ticker: str) -> Optional[dict]:
     try:
+        now = time.time()
+        cached = _SEC_COMPANY_FACTS_CACHE.get("data", {})
+        cached_entry = cached.get(ticker.upper())
+        if cached_entry and now - _SEC_COMPANY_FACTS_CACHE.get("timestamp", 0) < 24 * 3600:
+            return cached_entry
         cik_map = fetch_sec_ticker_cik_map()
         cik = cik_map.get(ticker.upper())
         if not cik:
             return None
         url = SEC_COMPANY_FACTS_URL.format(cik=cik)
-        response = requests.get(url, headers={"User-Agent": SEC_USER_AGENT}, timeout=20)
+        headers = sec_headers()
+        if not headers:
+            return None
+        response = requests.get(url, headers=headers, timeout=20)
         response.raise_for_status()
         data = response.json()
+        cached[ticker.upper()] = data
+        _SEC_COMPANY_FACTS_CACHE["data"] = cached
+        _SEC_COMPANY_FACTS_CACHE["timestamp"] = now
+        return data
+    except Exception as exc:
+        logging.warning("SEC company facts failed for %s: %s", ticker, exc)
+        return None
+
+
+def fetch_sec_shares_outstanding(ticker: str) -> Optional[float]:
+    try:
+        data = fetch_sec_company_facts(ticker)
+        if not data:
+            return None
         facts = data.get("facts", {})
         candidates = [
             ("us-gaap", "CommonStockSharesOutstanding"),
@@ -380,26 +451,61 @@ def fetch_sec_shares_outstanding(ticker: str) -> Optional[float]:
         return None
 
 
+def fetch_sec_public_float(ticker: str) -> Optional[float]:
+    try:
+        data = fetch_sec_company_facts(ticker)
+        if not data:
+            return None
+        facts = data.get("facts", {})
+        candidates = [
+            ("us-gaap", "PublicFloat"),
+            ("dei", "EntityPublicFloat"),
+        ]
+        for namespace, tag in candidates:
+            tag_data = facts.get(namespace, {}).get(tag, {})
+            units = tag_data.get("units", {})
+            for unit_values in units.values():
+                val = select_latest_fact(unit_values)
+                if val is not None:
+                    return float(val)
+        return None
+    except Exception as exc:
+        logging.warning("SEC public float failed for %s: %s", ticker, exc)
+        return None
+
+
 def fetch_finra_short_interest(ticker: str) -> dict:
     now = time.time()
     cached = _FINRA_SI_CACHE.get(ticker)
     if cached and now - cached.get("timestamp", 0) < 12 * 3600:
         return cached.get("data", {})
     try:
-        payload = {
-            "compareFilters": [
-                {"compareType": "EQUAL", "fieldName": "issueSymbolIdentifier", "fieldValue": ticker.upper()}
-            ],
-            "limit": 50,
-        }
+        settlement_date = get_finra_latest_settlement_date()
+        compare_filters = [
+            {"compareType": "EQUAL", "fieldName": "symbolCode", "fieldValue": ticker.upper()}
+        ]
+        if settlement_date:
+            compare_filters.append(
+                {"compareType": "EQUAL", "fieldName": "settlementDate", "fieldValue": settlement_date}
+            )
+        payload = {"compareFilters": compare_filters, "limit": 50}
         headers = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": USER_AGENT}
         response = requests.post(FINRA_SHORT_INTEREST_URL, json=payload, headers=headers, timeout=20)
         response.raise_for_status()
+        if response.status_code == 204 or not response.text.strip():
+            return {}
         try:
             data = response.json()
         except Exception:
             snippet = response.text[:200].replace("\n", " ")
-            logging.warning("FINRA short interest non-JSON response for %s: %s", ticker, snippet)
+            logging.warning(
+                "FINRA short interest non-JSON response for %s: status=%s content-type=%s length=%s snippet=%s",
+                ticker,
+                response.status_code,
+                response.headers.get("Content-Type"),
+                len(response.text),
+                snippet,
+            )
             return {}
         if not isinstance(data, list) or not data:
             return {}
@@ -412,15 +518,171 @@ def fetch_finra_short_interest(ticker: str) -> dict:
 
         latest = max(data, key=parse_date)
         result = {
-            "short_interest_shares": latest.get("currentShortShareNumber"),
+            "short_interest_shares": latest.get("currentShortPositionQuantity"),
             "short_interest_date": latest.get("settlementDate"),
-            "days_to_cover": latest.get("daysToCoverNumber"),
+            "days_to_cover": latest.get("daysToCoverQuantity"),
         }
         _FINRA_SI_CACHE[ticker] = {"timestamp": now, "data": result}
         return result
     except Exception as exc:
         logging.warning("FINRA short interest failed for %s: %s", ticker, exc)
         return {}
+
+
+def get_finra_latest_settlement_date() -> Optional[str]:
+    if FINRA_SHORT_INTEREST_DATE:
+        return FINRA_SHORT_INTEREST_DATE
+    now = time.time()
+    cached = _FINRA_CALENDAR_CACHE.get("date")
+    if cached and now - _FINRA_CALENDAR_CACHE.get("timestamp", 0) < 24 * 3600:
+        return cached
+    settlement = fetch_finra_settlement_from_calendar()
+    _FINRA_CALENDAR_CACHE["date"] = settlement
+    _FINRA_CALENDAR_CACHE["timestamp"] = now
+    if settlement:
+        return settlement
+    cached_partitions = _FINRA_PARTITION_CACHE.get("dates", [])
+    if cached_partitions and now - _FINRA_PARTITION_CACHE.get("timestamp", 0) < 24 * 3600:
+        return cached_partitions[0] if cached_partitions else None
+    try:
+        headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+        response = requests.get(FINRA_PARTITIONS_URL, headers=headers, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+        dates = []
+        candidates = []
+        if isinstance(data, dict):
+            candidates.append(data.get("partitions"))
+            candidates.append(data.get("availablePartitions"))
+        if isinstance(data, list):
+            candidates.append(data)
+        for entry in candidates:
+            if not entry:
+                continue
+            if isinstance(entry, list):
+                for item in entry:
+                    if isinstance(item, dict):
+                        parts = item.get("partitions") or item.get("values") or item.get("availablePartitions")
+                        if isinstance(parts, list):
+                            dates.extend(parts)
+                    elif isinstance(item, str):
+                        dates.append(item)
+            elif isinstance(entry, dict):
+                parts = entry.get("partitions") or entry.get("values")
+                if isinstance(parts, list):
+                    dates.extend(parts)
+        dates = [d for d in dates if isinstance(d, str) and re.match(r"20\d{2}-\d{2}-\d{2}", d)]
+        dates = sorted(set(dates), reverse=True)
+        _FINRA_PARTITION_CACHE["dates"] = dates
+        _FINRA_PARTITION_CACHE["timestamp"] = now
+        if dates:
+            return dates[0]
+    except Exception as exc:
+        logging.warning("FINRA partition lookup failed: %s", exc)
+    logging.warning("FINRA calendar did not return a settlement date")
+    return None
+
+
+def fetch_finra_settlement_from_calendar() -> Optional[str]:
+    try:
+        headers = {"User-Agent": USER_AGENT}
+        response = requests.get(FINRA_SCHEDULE_URL, headers=headers, timeout=20)
+        response.raise_for_status()
+        text = response.text
+        clean = re.sub(r"<[^>]+>", " ", text)
+        clean = clean.replace("&nbsp;", " ")
+        # find year sections like "2026 Short Interest Reporting Dates"
+        year_matches = list(re.finditer(r"(20\d{2})\s+Short Interest Reporting Dates", clean))
+        months = {
+            "January": 1,
+            "February": 2,
+            "March": 3,
+            "April": 4,
+            "May": 5,
+            "June": 6,
+            "July": 7,
+            "August": 8,
+            "September": 9,
+            "October": 10,
+            "November": 11,
+            "December": 12,
+        }
+        dates = []
+        month_pattern = r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})"
+        month_short_pattern = (
+            r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+(\d{1,2})\s*,?\s*(20\d{2})"
+        )
+        month_short_map = {
+            "Jan": "January",
+            "Feb": "February",
+            "Mar": "March",
+            "Apr": "April",
+            "May": "May",
+            "Jun": "June",
+            "Jul": "July",
+            "Aug": "August",
+            "Sep": "September",
+            "Sept": "September",
+            "Oct": "October",
+            "Nov": "November",
+            "Dec": "December",
+        }
+        if year_matches:
+            for idx, match in enumerate(year_matches):
+                year = int(match.group(1))
+                start = match.end()
+                end = year_matches[idx + 1].start() if idx + 1 < len(year_matches) else len(text)
+                section = clean[start:end]
+                for month_name, day_str in re.findall(month_pattern, section):
+                    try:
+                        dt = date_cls(year, months[month_name], int(day_str))
+                    except Exception:
+                        continue
+                    dates.append(dt)
+                for short_month, day_str, year_str in re.findall(month_short_pattern, section):
+                    month_name = month_short_map.get(short_month)
+                    if not month_name:
+                        continue
+                    try:
+                        dt = date_cls(int(year_str), months[month_name], int(day_str))
+                    except Exception:
+                        continue
+                    dates.append(dt)
+        else:
+            # fallback: assume current year if no headers
+            year = date_cls.today().year
+            for month_name, day_str in re.findall(month_pattern, clean):
+                try:
+                    dt = date_cls(year, months[month_name], int(day_str))
+                except Exception:
+                    continue
+                dates.append(dt)
+            for short_month, day_str, year_str in re.findall(month_short_pattern, clean):
+                month_name = month_short_map.get(short_month)
+                if not month_name:
+                    continue
+                try:
+                    dt = date_cls(int(year_str), months[month_name], int(day_str))
+                except Exception:
+                    continue
+                dates.append(dt)
+            for month_str, day_str, year_str in re.findall(r"(\d{1,2})/(\d{1,2})/(20\d{2})", clean):
+                try:
+                    dt = date_cls(int(year_str), int(month_str), int(day_str))
+                except Exception:
+                    continue
+                dates.append(dt)
+        if not dates:
+            return None
+        today = date_cls.today()
+        past_dates = [d for d in dates if d <= today]
+        if not past_dates:
+            return None
+        latest = max(past_dates)
+        return latest.isoformat()
+    except Exception as exc:
+        logging.warning("FINRA calendar scrape failed: %s", exc)
+        return None
 
 
 def fetch_ai_catalyst(state: dict, event_id: str, payload: dict) -> dict:
@@ -725,7 +987,13 @@ def fetch_market_data(ticker: str) -> dict:
     av_quote = fetch_alphavantage_quote(ticker)
     price = av_quote.get("price")
     prev_close = av_quote.get("prev_close")
+    if price is None:
+        td_quote = fetch_twelvedata_quote(ticker)
+        price = td_quote.get("price")
+        if prev_close is None:
+            prev_close = td_quote.get("prev_close")
     shares = fetch_sec_shares_outstanding(ticker)
+    public_float = fetch_sec_public_float(ticker)
     market_cap = price * shares if price is not None and shares is not None else None
     overnight_change = None
     if prev_close and price is not None:
@@ -737,7 +1005,7 @@ def fetch_market_data(ticker: str) -> dict:
     return {
         "price": format_price(price),
         "market_cap": format_compact(market_cap),
-        "float": "n/a",
+        "float": format_compact(public_float),
         "prev_close": prev_close,
         "ticker": ticker,
         "overnight_change": overnight_change,
@@ -884,7 +1152,7 @@ def send_notification(title: str, body: str, open_url: Optional[str] = None) -> 
                 args.extend(["-activate", TERMINAL_NOTIFIER_ACTIVATE])
             if open_url and open_url.startswith("http"):
                 logging.info("Notification open URL: %s", open_url)
-                args.extend(["-open", open_url, "-execute", f"open {open_url}"])
+                args.extend(["-open", open_url])
             subprocess.run(args, check=False)
         else:
             logging.info("Using osascript notifications (no terminal-notifier found)")
@@ -979,6 +1247,10 @@ def details_url(event_id: str) -> str:
     return f"http://{DETAILS_HOST}:{DETAILS_PORT}/alerts/{quote(event_id)}"
 
 
+def maybe_details_url(event_id: str) -> Optional[str]:
+    return details_url(event_id) if DETAILS_AVAILABLE else None
+
+
 def render_alert_page(alert: dict) -> str:
     def render_value(value: str) -> str:
         text = html_lib.escape(str(value))
@@ -1051,6 +1323,7 @@ def render_alert_page(alert: dict) -> str:
 
 
 def start_details_server() -> bool:
+    global DETAILS_AVAILABLE
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
             parsed = urlparse(self.path)
@@ -1076,6 +1349,8 @@ def start_details_server() -> bool:
             body = render_alert_page(found).encode("utf-8", errors="ignore")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.send_header("Pragma", "no-cache")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -1087,6 +1362,7 @@ def start_details_server() -> bool:
         server = HTTPServer((DETAILS_HOST, DETAILS_PORT), Handler)
     except OSError as exc:
         logging.warning("Details server failed to start: %s", exc)
+        DETAILS_AVAILABLE = False
         return False
 
     def run():
@@ -1095,6 +1371,7 @@ def start_details_server() -> bool:
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
     logging.info("Details server listening on http://%s:%s", DETAILS_HOST, DETAILS_PORT)
+    DETAILS_AVAILABLE = True
     return True
 
 
@@ -1228,10 +1505,9 @@ def process_due_resumes(state: dict) -> int:
             title = f"RESUME: {ticker}"
             if TEST_MODE:
                 title = f"TEST {title}"
-            more_details = details_url(event_id)
+            more_details = maybe_details_url(event_id)
             news, market = get_enrichment(ticker, pending.get("company_name", ""))
             body = build_scheduled_resume_body(pending, more_details=more_details, news=news, market=market)
-            send_notification(title, body, open_url=more_details)
             record_alert(
                 state,
                 build_alert_record(
@@ -1249,6 +1525,8 @@ def process_due_resumes(state: dict) -> int:
                     "scheduled",
                 ),
             )
+            save_state(state)
+            send_notification(title, body, open_url=more_details)
             logging.info("Sent scheduled RESUME for %s", ticker)
             state.setdefault("halt_counts", {})[ticker] = 0
             sent += 1
@@ -1300,7 +1578,7 @@ def process_feed(state: dict) -> int:
         title = f"{event_type}: {ticker}"
         if TEST_MODE:
             title = f"TEST {title}"
-        more_details = details_url(event_id)
+        more_details = maybe_details_url(event_id)
         news, market = get_enrichment(ticker, get_first(entry, ["name"], ""))
         reason_code = get_first(entry, ["reasoncode", "reason_code", "reason"], "")
         halt_direction = compute_halt_direction(reason_code, market)
@@ -1321,12 +1599,14 @@ def process_feed(state: dict) -> int:
                 entry["catalyst_confidence"] = catalyst.get("confidence", "")
                 entry["catalyst_rationale"] = catalyst.get("rationale", "")
         body = build_body(entry, event_type, more_details=more_details, news=news, market=market)
-
-        send_notification(title, body, open_url=more_details)
+        seen_ids.add(event_id)
+        state["seen_ids"] = list(seen_ids)
         record_alert(
             state,
             build_alert_record(entry, event_type, news, market, event_id, entry.get("source", "unknown")),
         )
+        save_state(state)
+        send_notification(title, body, open_url=more_details)
         logging.info("Notified %s for %s", event_type, ticker)
 
         if event_type == "HALT":
@@ -1335,7 +1615,6 @@ def process_feed(state: dict) -> int:
             cancel_pending_for_ticker(state, ticker)
             state.setdefault("halt_counts", {})[ticker] = 0
 
-        seen_ids.add(event_id)
         new_count += 1
 
     state["seen_ids"] = list(seen_ids)
@@ -1371,41 +1650,47 @@ def main() -> None:
     start_details_server()
 
     if args.test_notify:
-        title = "TEST HALT: DEMO"
-        more_details = details_url("test-alert")
+        test_ticker = "CCL"
+        title = f"TEST HALT: {test_ticker}"
+        event_id = f"test-alert-{test_ticker}-{int(time.time())}"
+        more_details = maybe_details_url(event_id)
+        market = fetch_market_data(test_ticker)
+        lines = [
+            "Test alert",
+            f"Ticker: {test_ticker}",
+            "Halt date: 2026-03-31",
+            "Reason: TEST",
+            "News: n/a",
+            "News summary: n/a",
+            f"Price: {market.get('price')}",
+            f"Market cap: {market.get('market_cap')}",
+            f"Float: {market.get('float')}",
+        ]
+        if more_details:
+            lines.append(f"More details: {more_details}")
         body = "\n".join(
             [
-                "Test alert",
-                "Ticker: TEST",
-                "Halt date: 2026-03-26",
-                "Reason: TEST",
-                "News: n/a",
-                "News summary: n/a",
-                "Price: n/a",
-                "Market cap: n/a",
-                "Float: n/a",
-                f"More details: {more_details}",
+                *lines,
             ]
         )
-        send_notification(title, body, open_url=more_details)
         state = load_state()
         record_alert(
             state,
             {
-                "event_id": "test-alert",
+                "event_id": event_id,
                 "event_type": "HALT",
-                "ticker": "TEST",
-                "company_name": "Test Company",
-                "halt_date": "2026-03-26",
+                "ticker": test_ticker,
+                "company_name": "Carnival Cruise",
+                "halt_date": "2026-03-31",
                 "halt_time": "",
                 "resume_date": "",
                 "resume_time": "",
                 "reason": "TEST",
                 "news_link": "n/a",
                 "news_summary": "n/a",
-                "price": "n/a",
-                "market_cap": "n/a",
-                "float": "n/a",
+                "price": market.get("price"),
+                "market_cap": market.get("market_cap"),
+                "float": market.get("float"),
                 "catalyst_label": "noise",
                 "catalyst_confidence": 0.0,
                 "catalyst_rationale": "Test alert",
@@ -1415,6 +1700,7 @@ def main() -> None:
             },
         )
         save_state(state)
+        send_notification(title, body, open_url=more_details)
         logging.info("Sent test notification")
         if args.keep_alive_seconds > 0:
             logging.info("Keeping details server alive for %s seconds", args.keep_alive_seconds)
@@ -1422,10 +1708,9 @@ def main() -> None:
         return
 
     logging.info("Starting trade halt alerts")
-    state = load_state()
-
     while True:
         try:
+            state = load_state()
             new_count = process_feed(state)
             if new_count:
                 logging.info("Processed %s new events", new_count)

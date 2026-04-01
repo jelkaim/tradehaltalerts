@@ -6,7 +6,7 @@ LABEL="com.tradehaltalerts"
 DOMAIN="gui/$(id -u)/${LABEL}"
 
 usage() {
-  echo "Usage: $0 {start|stop|restart|status|enable|disable}"
+  echo "Usage: $0 {start|stop|restart|status|enable|disable|pause|resume}"
 }
 
 ensure_plist() {
@@ -45,6 +45,38 @@ case "$cmd" in
   status)
     ensure_plist
     launchctl print "$DOMAIN" | head -n 25
+    ;;
+  pause)
+    python3 - <<'PY'
+import json
+from pathlib import Path
+path = Path.home() / '.tradehaltalerts_state.json'
+data = {"seen_ids": [], "pending_resumes": [], "halt_counts": {}, "last_poll": 0, "recent_alerts": [], "paused": True}
+if path.exists():
+    try:
+        data.update(json.loads(path.read_text()))
+    except Exception:
+        pass
+data["paused"] = True
+path.write_text(json.dumps(data, indent=2, sort_keys=True))
+print("Alerts paused")
+PY
+    ;;
+  resume)
+    python3 - <<'PY'
+import json
+from pathlib import Path
+path = Path.home() / '.tradehaltalerts_state.json'
+data = {"seen_ids": [], "pending_resumes": [], "halt_counts": {}, "last_poll": 0, "recent_alerts": [], "paused": False}
+if path.exists():
+    try:
+        data.update(json.loads(path.read_text()))
+    except Exception:
+        pass
+data["paused"] = False
+path.write_text(json.dumps(data, indent=2, sort_keys=True))
+print("Alerts resumed")
+PY
     ;;
   enable)
     ensure_plist

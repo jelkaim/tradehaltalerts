@@ -27,6 +27,8 @@ export FMP_API_KEY="your_key_here"
 export ALPHAVANTAGE_API_KEY="your_key_here"
 export TWELVEDATA_API_KEY="your_key_here"
 export SEC_USER_AGENT="TradeHaltAlerts/1.0 (your_email@example.com)"
+export OPENAI_API_KEY="your_key_here"
+export HALT_ALERTS_AI_CATALYST=1
 python3 scripts/halt_alerts.py
 ```
 
@@ -34,7 +36,22 @@ python3 scripts/halt_alerts.py
 1) Copy the plist into LaunchAgents
 ```bash
 mkdir -p ~/Library/LaunchAgents
+mkdir -p /Users/jelk/trade-halt-alerts/logs
 cp macos/com.tradehaltalerts.plist ~/Library/LaunchAgents/
+```
+2) Set environment variables (recommended: edit the plist `EnvironmentVariables` block)
+
+You can either edit `~/Library/LaunchAgents/com.tradehaltalerts.plist` directly or set them via `launchctl setenv`.
+Shell `export` commands only affect the current terminal session and do not automatically apply to LaunchAgents.
+
+Minimum for price, market cap, and float:
+- `ALPHAVANTAGE_API_KEY` or `TWELVEDATA_API_KEY`
+- `SEC_USER_AGENT` with contact info
+
+3) Load the agent
+```bash
+launchctl unload ~/Library/LaunchAgents/com.tradehaltalerts.plist
+launchctl load ~/Library/LaunchAgents/com.tradehaltalerts.plist
 ```
 
 2) Provide the API key for the agent
@@ -66,10 +83,12 @@ Use `scripts/alerts_ctl.sh` to start or stop alerts.
 ## Notes
 - State is persisted in `~/.tradehaltalerts_state.json` to deduplicate alerts across restarts.
 - Logs are written to `logs/halt_alerts.log` and also printed to stdout.
-- If the FMP API key is missing or the API fails, price, market cap, and float show `n/a`.
-- Optional fallback: set `ALPHAVANTAGE_API_KEY` to fetch price from Alpha Vantage and compute market cap using SEC shares outstanding. Float remains `n/a`.
-- For SEC requests, you can set `SEC_USER_AGENT` to a descriptive value with contact info.
+- If the FMP API key is missing or the API fails, price, market cap, and float use fallbacks.
+- Optional fallback: set `ALPHAVANTAGE_API_KEY` to fetch price from Alpha Vantage. If Alpha Vantage is missing or rate limited, Twelve Data (`TWELVEDATA_API_KEY`) is used for price.
+- SEC endpoints require a descriptive `SEC_USER_AGENT` with contact info. Without it, shares outstanding and float are skipped.
 - Short interest is pulled from FINRA's Equity Short Interest dataset and is updated on the FINRA schedule (typically twice per month).
+- You can override the FINRA settlement date with `FINRA_SHORT_INTEREST_DATE=YYYY-MM-DD` if the API does not return a partition list.
+- AI catalyst classification is optional. It runs only when news exists and labels catalyst strength as strong, moderate, weak, or noise with a confidence score.
 - For LULD halts (`LUDP`, `LUDS`, `M`), the app can infer halt direction using Twelve Data 1 minute intraday data. Alpha Vantage intraday is a fallback if available. Set `HALT_ALERTS_INTRADAY_LOOKBACK_MINUTES` (2 to 5, default 5).
 - Trade halts are fetched from NasdaqTrader RSS first, then the NasdaqTrader Trade Halts page, then the NYSE CSV endpoint as a fallback.
 - Events are deduplicated across all sources using a source independent event id.

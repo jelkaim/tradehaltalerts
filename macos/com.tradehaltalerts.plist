@@ -11,10 +11,35 @@
     </array>
     <key>RunAtLoad</key>
     <true/>
-    <key>StartInterval</key>
-    <integer>60</integer>
+    <key>KeepAlive</key>
+    <true/>
     <key>WorkingDirectory</key>
     <string>/Users/jelk/trade-halt-alerts</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>FMP_API_KEY</key>
+      <string></string>
+      <key>ALPHAVANTAGE_API_KEY</key>
+      <string>RGQTSJ96HIHF178F</string>
+      <key>TWELVEDATA_API_KEY</key>
+      <string>d4d73d484f0b4fc88bea0a8b151e0fd9</string>
+      <key>SEC_USER_AGENT</key>
+      <string>TradeHaltAlerts/1.0 (jelkaim@gmail.com)</string>
+      <key>X_API_BEARER_TOKEN</key>
+      <string></string>
+      <key>OPENAI_API_KEY</key>
+      <string></string>
+      <key>HALT_ALERTS_AI_CATALYST</key>
+      <string>0</string>
+      <key>TERMINAL_NOTIFIER_PATH</key>
+      <string></string>
+      <key>TERMINAL_NOTIFIER_SENDER</key>
+      <string></string>
+      <key>TERMINAL_NOTIFIER_ACTIVATE</key>
+      <string></string>
+      <key>HALT_ALERTS_OPEN_DETAILS</key>
+      <string></string>
+    </dict>
     <key>StandardOutPath</key>
     <string>/Users/jelk/trade-halt-alerts/logs/launchagent.out</string>
     <key>StandardErrorPath</key>
