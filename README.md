@@ -32,6 +32,14 @@ export HALT_ALERTS_AI_CATALYST=1
 python3 scripts/halt_alerts.py
 ```
 
+## Daily Use
+```bash
+alias tha='/Users/jelk/trade-halt-alerts/scripts/alerts_ctl.sh'
+tha status
+tha toggle
+tha open
+```
+
 ## LaunchAgent
 1) Copy the plist into LaunchAgents
 ```bash
@@ -52,6 +60,29 @@ Minimum for price, market cap, and float:
 ```bash
 launchctl unload ~/Library/LaunchAgents/com.tradehaltalerts.plist
 launchctl load ~/Library/LaunchAgents/com.tradehaltalerts.plist
+```
+
+## Alert Center
+The local Alert Center UI is available at:
+`http://127.0.0.1:8787/`
+
+Pause and resume can be done directly in the browser.
+
+## Menu Bar App
+1) Install dependency
+```bash
+pip install rumps
+```
+
+2) Copy the menu plist
+```bash
+cp macos/com.tradehaltalerts.menu.plist ~/Library/LaunchAgents/
+```
+
+3) Load the menu app
+```bash
+launchctl unload ~/Library/LaunchAgents/com.tradehaltalerts.menu.plist
+launchctl load ~/Library/LaunchAgents/com.tradehaltalerts.menu.plist
 ```
 
 2) Provide the API key for the agent
@@ -86,8 +117,8 @@ Use `scripts/alerts_ctl.sh` to start or stop alerts.
 - If the FMP API key is missing or the API fails, price, market cap, and float use fallbacks.
 - Optional fallback: set `ALPHAVANTAGE_API_KEY` to fetch price from Alpha Vantage. If Alpha Vantage is missing or rate limited, Twelve Data (`TWELVEDATA_API_KEY`) is used for price.
 - SEC endpoints require a descriptive `SEC_USER_AGENT` with contact info. Without it, shares outstanding and float are skipped.
-- Short interest is pulled from FINRA's Equity Short Interest dataset and is updated on the FINRA schedule (typically twice per month).
-- You can override the FINRA settlement date with `FINRA_SHORT_INTEREST_DATE=YYYY-MM-DD` if the API does not return a partition list.
+- Short interest is pulled from FINRA's Consolidated Short Interest dataset and is updated on the FINRA schedule (typically twice per month).
+- You can override the FINRA settlement date with `FINRA_SHORT_INTEREST_DATE=YYYY-MM-DD`.
 - AI catalyst classification is optional. It runs only when news exists and labels catalyst strength as strong, moderate, weak, or noise with a confidence score.
 - For LULD halts (`LUDP`, `LUDS`, `M`), the app can infer halt direction using Twelve Data 1 minute intraday data. Alpha Vantage intraday is a fallback if available. Set `HALT_ALERTS_INTRADAY_LOOKBACK_MINUTES` (2 to 5, default 5).
 - Trade halts are fetched from NasdaqTrader RSS first, then the NasdaqTrader Trade Halts page, then the NYSE CSV endpoint as a fallback.
@@ -95,11 +126,12 @@ Use `scripts/alerts_ctl.sh` to start or stop alerts.
 - On first run, existing halts are seeded as seen to avoid a notification flood. Only new halts after startup trigger alerts.
 - Google News enrichment tries multiple queries using the ticker and company name, and falls back to a clear \"No recent Google News results\" message if nothing is found.
 - If Google News has no results, the app can query the X API for a recent tweet within the last 48 hours using `X_API_BEARER_TOKEN`. If neither source has results, it shows \"No recent news or tweets\".
-- Each notification includes a \"More details\" link to a local details page served at `http://127.0.0.1:8787/alerts/<event_id>`. You can change the port with `HALT_ALERTS_DETAILS_PORT`.
-- If `terminal-notifier` is installed, clicking the notification opens the \"More details\" link. Otherwise it falls back to `osascript` with no click action.
+- Each notification includes a \"More details\" link to the Alert Center at `http://127.0.0.1:8787/?alert=<event_id>`. You can change the port with `HALT_ALERTS_DETAILS_PORT`.
+- If `terminal-notifier` is installed, clicking the notification opens the Alert Center link. Otherwise it falls back to `osascript` with no click action.
 - If the LaunchAgent cannot find `terminal-notifier`, set `TERMINAL_NOTIFIER_PATH` to the full path, for example `/opt/homebrew/bin/terminal-notifier`.
 - If notifications do not appear for `terminal-notifier`, set `TERMINAL_NOTIFIER_SENDER=com.apple.Terminal` so it uses Terminal's notification permissions. You can also set `TERMINAL_NOTIFIER_ACTIVATE=com.apple.Terminal`.
 - If clicking is unreliable, set `HALT_ALERTS_OPEN_DETAILS=auto` to automatically open the details page when a notification is sent.
+- `pause` keeps the process running but suppresses notifications. `stop` unloads the LaunchAgent and halts polling.
 
 ## Test mode
 To speed up scheduled resume alerts, set these environment variables before starting the script or LaunchAgent.

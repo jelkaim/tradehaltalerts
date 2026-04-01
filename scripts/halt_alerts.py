@@ -1268,8 +1268,15 @@ def details_url(event_id: str) -> str:
     return f"http://{DETAILS_HOST}:{DETAILS_PORT}/alerts/{quote(event_id)}"
 
 
+def alert_center_url(event_id: Optional[str] = None) -> str:
+    base = f"http://{DETAILS_HOST}:{DETAILS_PORT}/"
+    if event_id:
+        return f"{base}?alert={quote(event_id)}"
+    return base
+
+
 def maybe_details_url(event_id: str) -> Optional[str]:
-    return details_url(event_id) if DETAILS_AVAILABLE else None
+    return alert_center_url(event_id) if DETAILS_AVAILABLE else None
 
 
 def render_alert_page(alert: dict) -> str:
@@ -1349,11 +1356,354 @@ def render_alert_page(alert: dict) -> str:
     return "\n".join(lines)
 
 
+def render_alert_center_page() -> str:
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Trade Halt Alert Center</title>
+  <style>
+    :root {
+      color-scheme: light;
+    }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Mono", "Menlo", "Monaco", monospace;
+      background: #0f1115;
+      color: #e7e9ee;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      justify-content: space-between;
+      padding: 16px 20px;
+      background: linear-gradient(135deg, #161b22, #0f1115);
+      border-bottom: 1px solid #23262f;
+    }
+    header h1 {
+      margin: 0;
+      font-size: 20px;
+      letter-spacing: 0.4px;
+    }
+    .status {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      font-size: 13px;
+    }
+    .pill {
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: #1f2430;
+      border: 1px solid #2c313d;
+    }
+    .pill.paused {
+      background: #3a1f1f;
+      border-color: #612424;
+      color: #ff8a8a;
+    }
+    .controls button {
+      padding: 6px 12px;
+      border-radius: 6px;
+      border: 1px solid #2b303b;
+      background: #1a1f2b;
+      color: #e7e9ee;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .controls button:hover {
+      background: #242a38;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      gap: 0;
+      min-height: calc(100vh - 70px);
+    }
+    .sidebar {
+      border-right: 1px solid #23262f;
+      background: #11131a;
+      display: flex;
+      flex-direction: column;
+    }
+    .filters {
+      padding: 12px;
+      border-bottom: 1px solid #23262f;
+      display: grid;
+      gap: 8px;
+    }
+    .filters input, .filters select {
+      width: 100%;
+      padding: 6px 8px;
+      background: #0c0f14;
+      border: 1px solid #2b303b;
+      border-radius: 6px;
+      color: #e7e9ee;
+      font-size: 12px;
+    }
+    .alert-list {
+      overflow-y: auto;
+      flex: 1;
+    }
+    .alert-card {
+      padding: 12px;
+      border-bottom: 1px solid #1f232c;
+      cursor: pointer;
+      display: grid;
+      gap: 6px;
+    }
+    .alert-card.important {
+      border-left: 4px solid #d94848;
+      background: #1a1416;
+    }
+    .alert-card:hover {
+      background: #171b25;
+    }
+    .alert-card .title {
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .alert-card .meta {
+      font-size: 11px;
+      color: #a4a9b6;
+    }
+    .content {
+      padding: 20px;
+    }
+    .content h2 {
+      margin-top: 0;
+      font-size: 22px;
+    }
+    .content .important-title {
+      color: #d94848;
+    }
+    .content ul {
+      padding-left: 18px;
+    }
+    .content a {
+      color: #7db3ff;
+    }
+    @media (max-width: 900px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
+      .sidebar {
+        border-right: none;
+        border-bottom: 1px solid #23262f;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Trade Halt Alert Center</h1>
+    <div class="status">
+      <span id="agent-status" class="pill">Loading</span>
+      <span id="paused-status" class="pill">Alerts</span>
+    </div>
+    <div class="controls">
+      <button onclick="pauseAlerts()">Pause</button>
+      <button onclick="resumeAlerts()">Resume</button>
+      <button onclick="refreshAlerts()">Refresh</button>
+    </div>
+  </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="filters">
+        <input id="search" placeholder="Search ticker or company" oninput="renderList()"/>
+        <select id="filter-type" onchange="renderList()">
+          <option value="">All events</option>
+          <option value="HALT">HALT</option>
+          <option value="RESUME">RESUME</option>
+        </select>
+        <label style="font-size:12px;color:#a4a9b6;">
+          <input type="checkbox" id="filter-important" onchange="renderList()"/> Important only
+        </label>
+      </div>
+      <div id="alert-list" class="alert-list"></div>
+    </aside>
+    <main class="content" id="alert-details">
+      <h2>Select an alert</h2>
+      <p>Use the list to view details.</p>
+    </main>
+  </div>
+  <script>
+    let alerts = [];
+    let selectedId = null;
+
+    async function refreshAlerts() {
+      const response = await fetch('/api/alerts');
+      alerts = await response.json();
+      renderList();
+      const urlParams = new URLSearchParams(window.location.search);
+      const initial = urlParams.get('alert');
+      if (initial) {
+        selectAlert(initial);
+      } else if (!selectedId && alerts.length) {
+        selectAlert(alerts[0].event_id);
+      }
+    }
+
+    function renderList() {
+      const list = document.getElementById('alert-list');
+      list.innerHTML = '';
+      const query = document.getElementById('search').value.toLowerCase();
+      const type = document.getElementById('filter-type').value;
+      const importantOnly = document.getElementById('filter-important').checked;
+      const filtered = alerts.filter(alert => {
+        const text = `${alert.ticker || ''} ${alert.company_name || ''}`.toLowerCase();
+        if (query && !text.includes(query)) return false;
+        if (type && alert.event_type !== type) return false;
+        if (importantOnly && !alert.important) return false;
+        return true;
+      });
+      filtered.forEach(alert => {
+        const card = document.createElement('div');
+        card.className = 'alert-card' + (alert.important ? ' important' : '');
+        card.onclick = () => selectAlert(alert.event_id);
+        card.innerHTML = `
+          <div class="title">${alert.title || alert.event_type}</div>
+          <div class="meta">${alert.ticker || ''} • ${alert.halt_date || alert.resume_date || ''}</div>
+          <div class="meta">${alert.reason || ''}</div>
+        `;
+        list.appendChild(card);
+      });
+    }
+
+    async function selectAlert(id) {
+      selectedId = id;
+      history.replaceState(null, '', `/?alert=${encodeURIComponent(id)}`);
+      const response = await fetch(`/api/alerts/${encodeURIComponent(id)}`);
+      const alert = await response.json();
+      const details = document.getElementById('alert-details');
+      if (!alert.event_id) {
+        details.innerHTML = '<h2>Alert not found</h2>';
+        return;
+      }
+      const titleClass = alert.important ? 'important-title' : '';
+      details.innerHTML = `
+        <h2 class="${titleClass}">${alert.title || 'Alert'}</h2>
+        <ul>
+          ${renderDetailLine('Ticker', alert.ticker)}
+          ${renderDetailLine('Company', alert.company_name)}
+          ${renderDetailLine('Halt date', alert.halt_date)}
+          ${renderDetailLine('Halt time', alert.halt_time)}
+          ${renderDetailLine('Resume date', alert.resume_date)}
+          ${renderDetailLine('Resume time', alert.resume_time)}
+          ${renderDetailLine('Reason', alert.reason)}
+          ${renderDetailLine('Halt direction', alert.halt_direction)}
+          ${renderDetailLine('News link', alert.news_link, true)}
+          ${renderDetailLine('News summary', alert.news_summary)}
+          ${renderDetailLine('Price', alert.price)}
+          ${renderDetailLine('Market cap', alert.market_cap)}
+          ${renderDetailLine('Float', alert.float)}
+          ${renderDetailLine('Overnight change', alert.overnight_change ? (alert.overnight_change * 100).toFixed(2) + '%' : '')}
+          ${renderDetailLine('Short interest shares', alert.short_interest_shares)}
+          ${renderDetailLine('Short interest date', alert.short_interest_date)}
+          ${renderDetailLine('Days to cover', alert.days_to_cover)}
+          ${renderDetailLine('Important', alert.important ? 'YES' : '')}
+          ${renderDetailLine('Source', alert.source)}
+          ${renderDetailLine('Event type', alert.event_type)}
+          ${renderDetailLine('Timestamp', alert.timestamp)}
+        </ul>
+      `;
+    }
+
+    function renderDetailLine(label, value, isLink) {
+      if (!value) return '';
+      if (isLink && String(value).startsWith('http')) {
+        return `<li><strong>${label}:</strong> <a href="${value}" target="_blank" rel="noopener noreferrer">${value}</a></li>`;
+      }
+      return `<li><strong>${label}:</strong> ${value}</li>`;
+    }
+
+    async function pauseAlerts() {
+      await fetch('/api/pause', {method: 'POST'});
+      refreshStatus();
+    }
+
+    async function resumeAlerts() {
+      await fetch('/api/resume', {method: 'POST'});
+      refreshStatus();
+    }
+
+    async function refreshStatus() {
+      const response = await fetch('/api/status');
+      const status = await response.json();
+      const agent = document.getElementById('agent-status');
+      const paused = document.getElementById('paused-status');
+      agent.textContent = status.running ? 'Running' : 'Stopped';
+      paused.textContent = status.paused ? 'Paused' : 'Active';
+      paused.className = status.paused ? 'pill paused' : 'pill';
+    }
+
+    refreshAlerts();
+    refreshStatus();
+    setInterval(refreshAlerts, 15000);
+    setInterval(refreshStatus, 10000);
+  </script>
+</body>
+</html>
+"""
+
+
 def start_details_server() -> bool:
     global DETAILS_AVAILABLE
+    def json_response(handler: BaseHTTPRequestHandler, status: int, payload) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        handler.send_header("Pragma", "no-cache")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    def update_pause_state(paused: bool) -> None:
+        state = load_state()
+        state["paused"] = paused
+        save_state(state)
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
             parsed = urlparse(self.path)
+            if parsed.path == "/":
+                body = render_alert_center_page().encode("utf-8", errors="ignore")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if parsed.path == "/api/status":
+                state = load_state()
+                json_response(
+                    self,
+                    200,
+                    {
+                        "paused": bool(state.get("paused", False)),
+                        "last_poll": state.get("last_poll", 0),
+                        "alert_count": len(state.get("recent_alerts", [])),
+                        "running": True,
+                    },
+                )
+                return
+            if parsed.path == "/api/alerts":
+                state = load_state()
+                alerts = list(reversed(state.get("recent_alerts", [])))
+                json_response(self, 200, alerts)
+                return
+            if parsed.path.startswith("/api/alerts/"):
+                alert_id = unquote(parsed.path[len("/api/alerts/"):])
+                state = load_state()
+                found = next((a for a in state.get("recent_alerts", []) if a.get("event_id") == alert_id), {})
+                json_response(self, 200, found or {})
+                return
             if not parsed.path.startswith("/alerts/"):
                 self.send_response(404)
                 self.end_headers()
@@ -1384,6 +1734,19 @@ def start_details_server() -> bool:
 
         def log_message(self, format, *args):  # noqa: A002
             return
+
+        def do_POST(self):  # noqa: N802
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/pause":
+                update_pause_state(True)
+                json_response(self, 200, {"paused": True})
+                return
+            if parsed.path == "/api/resume":
+                update_pause_state(False)
+                json_response(self, 200, {"paused": False})
+                return
+            self.send_response(404)
+            self.end_headers()
 
     try:
         server = HTTPServer((DETAILS_HOST, DETAILS_PORT), Handler)

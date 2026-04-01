@@ -4,9 +4,11 @@ set -euo pipefail
 PLIST="$HOME/Library/LaunchAgents/com.tradehaltalerts.plist"
 LABEL="com.tradehaltalerts"
 DOMAIN="gui/$(id -u)/${LABEL}"
+STATE_PATH="$HOME/.tradehaltalerts_state.json"
+DETAILS_PORT="${HALT_ALERTS_DETAILS_PORT:-8787}"
 
 usage() {
-  echo "Usage: $0 {start|stop|restart|status|enable|disable|pause|resume}"
+  echo "Usage: $0 {start|stop|restart|status|debug-status|toggle|pause|resume|open|enable|disable}"
 }
 
 ensure_plist() {
@@ -43,8 +45,76 @@ case "$cmd" in
     echo "Alerts restarted"
     ;;
   status)
+    agent_state="stopped"
+    if launchctl print "$DOMAIN" >/dev/null 2>&1; then
+      agent_state="running"
+    fi
+    paused="unknown"
+    last_poll="n/a"
+    pending="0"
+    recent="0"
+    if [ -f "$STATE_PATH" ]; then
+      paused=$(python3 - <<'PY'
+import json
+from pathlib import Path
+path = Path.home() / '.tradehaltalerts_state.json'
+data = json.loads(path.read_text())
+print("paused" if data.get("paused") else "active")
+PY
+)
+      last_poll=$(python3 - <<'PY'
+import json
+from datetime import datetime
+from pathlib import Path
+path = Path.home() / '.tradehaltalerts_state.json'
+data = json.loads(path.read_text())
+last = data.get("last_poll", 0)
+print(datetime.fromtimestamp(last).isoformat() if last else "n/a")
+PY
+)
+      pending=$(python3 - <<'PY'
+import json
+from pathlib import Path
+path = Path.home() / '.tradehaltalerts_state.json'
+data = json.loads(path.read_text())
+print(len(data.get("pending_resumes", [])))
+PY
+)
+      recent=$(python3 - <<'PY'
+import json
+from pathlib import Path
+path = Path.home() / '.tradehaltalerts_state.json'
+data = json.loads(path.read_text())
+print(len(data.get("recent_alerts", [])))
+PY
+)
+    fi
+    echo "Agent: $agent_state"
+    echo "Alerts: $paused"
+    echo "Last poll: $last_poll"
+    echo "Pending resumes: $pending"
+    echo "Recent alerts: $recent"
+    echo "Alert Center: http://127.0.0.1:${DETAILS_PORT}/"
+    ;;
+  debug-status)
     ensure_plist
     launchctl print "$DOMAIN" | head -n 25
+    ;;
+  toggle)
+    python3 - <<'PY'
+import json
+from pathlib import Path
+path = Path.home() / '.tradehaltalerts_state.json'
+data = {"seen_ids": [], "pending_resumes": [], "halt_counts": {}, "last_poll": 0, "recent_alerts": [], "paused": False}
+if path.exists():
+    try:
+        data.update(json.loads(path.read_text()))
+    except Exception:
+        pass
+data["paused"] = not bool(data.get("paused"))
+path.write_text(json.dumps(data, indent=2, sort_keys=True))
+print("Alerts paused" if data["paused"] else "Alerts resumed")
+PY
     ;;
   pause)
     python3 - <<'PY'
@@ -77,6 +147,9 @@ data["paused"] = False
 path.write_text(json.dumps(data, indent=2, sort_keys=True))
 print("Alerts resumed")
 PY
+    ;;
+  open)
+    open "http://127.0.0.1:${DETAILS_PORT}/"
     ;;
   enable)
     ensure_plist
