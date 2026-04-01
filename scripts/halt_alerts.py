@@ -1245,6 +1245,8 @@ def build_body(
         lines.append(f"Days to cover: {market.get('days_to_cover')}")
     if entry.get("halt_direction"):
         lines.insert(3, f"Halt direction: {entry.get('halt_direction')}")
+    if entry.get("important"):
+        lines.insert(3, "Important: YES")
     if more_details:
         lines.append(f"More details: {more_details}")
     if TEST_MODE:
@@ -1279,9 +1281,14 @@ def render_alert_page(alert: dict) -> str:
 
     reason_code = str(alert.get("reason", "")).strip().upper()
     reason_desc = HALT_CODE_DESCRIPTIONS.get(reason_code)
+    important = bool(alert.get("important"))
 
     lines = [
-        f"<h1>{html_lib.escape(alert.get('title', 'Alert'))}</h1>",
+        (
+            f"<h1 style=\"color:#c00000;\">{html_lib.escape(alert.get('title', 'Alert'))}</h1>"
+            if important
+            else f"<h1>{html_lib.escape(alert.get('title', 'Alert'))}</h1>"
+        ),
         "<ul>",
     ]
     for key, label in [
@@ -1302,6 +1309,7 @@ def render_alert_page(alert: dict) -> str:
         ("short_interest_shares", "Short interest shares"),
         ("short_interest_date", "Short interest date"),
         ("days_to_cover", "Days to cover"),
+        ("important", "Important"),
         ("catalyst_label", "Catalyst"),
         ("catalyst_confidence", "Catalyst confidence"),
         ("catalyst_rationale", "Catalyst rationale"),
@@ -1603,6 +1611,9 @@ def process_feed(state: dict) -> int:
         halt_direction = compute_halt_direction(reason_code, market)
         if halt_direction:
             entry["halt_direction"] = halt_direction
+        if event_type == "HALT" and halt_direction == "Up" and news.get("found"):
+            entry["important"] = True
+            title = f"IMPORTANT {title}"
         if news.get("found"):
             payload = {
                 "ticker": ticker,
@@ -1648,6 +1659,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Trade halt alerts")
     parser.add_argument("--test-notify", action="store_true", help="Send a single test notification and exit")
     parser.add_argument(
+        "--test-important",
+        action="store_true",
+        help="Send a test notification marked as important",
+    )
+    parser.add_argument(
         "--self-test",
         action="store_true",
         help="Print notification integration status and exit",
@@ -1668,13 +1684,16 @@ def main() -> None:
 
     start_details_server()
 
-    if args.test_notify:
+    if args.test_notify or args.test_important:
         test_ticker = "CCL"
         title = f"TEST HALT: {test_ticker}"
         event_id = f"test-alert-{test_ticker}-{int(time.time())}"
         more_details = maybe_details_url(event_id)
         market = fetch_market_data(test_ticker)
         short_interest = fetch_finra_short_interest(test_ticker)
+        important = bool(args.test_important)
+        if important:
+            title = f"IMPORTANT {title}"
         lines = [
             "Test alert",
             f"Ticker: {test_ticker}",
@@ -1686,6 +1705,8 @@ def main() -> None:
             f"Market cap: {market.get('market_cap')}",
             f"Float: {market.get('float')}",
         ]
+        if important:
+            lines.insert(3, "Important: YES")
         if short_interest.get("short_interest_shares"):
             lines.append(f"Short interest shares: {short_interest.get('short_interest_shares')}")
         if short_interest.get("short_interest_date"):
@@ -1720,6 +1741,7 @@ def main() -> None:
                 "short_interest_shares": short_interest.get("short_interest_shares"),
                 "short_interest_date": short_interest.get("short_interest_date"),
                 "days_to_cover": short_interest.get("days_to_cover"),
+                "important": important,
                 "catalyst_label": "noise",
                 "catalyst_confidence": 0.0,
                 "catalyst_rationale": "Test alert",
