@@ -67,6 +67,7 @@ The local Alert Center UI is available at:
 `http://127.0.0.1:8787/`
 
 Pause and resume can be done directly in the browser.
+Use the "Load Live Halts" button to pull the latest halts from all sources on demand.
 
 ## Menu Bar App
 1) Install dependency
@@ -139,6 +140,12 @@ To speed up scheduled resume alerts, set these environment variables before star
 export HALT_ALERTS_TEST_DELAY_FIRST=15
 export HALT_ALERTS_TEST_DELAY_SECOND=30
 export HALT_ALERTS_TEST_MODE=1
+```
+
+## Feed test
+To verify feed connectivity and counts per source:
+```bash
+python3 /Users/jelk/trade-halt-alerts/scripts/halt_alerts.py --self-test-fetch
 ```
 Values are in seconds and only affect the scheduled resume notifications for the first and second halt. When test mode is enabled, notifications are labeled as test alerts.
 

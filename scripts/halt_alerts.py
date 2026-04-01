@@ -13,7 +13,7 @@ import time
 from datetime import timedelta
 from datetime import datetime, timezone
 from datetime import date as date_cls
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from io import StringIO
 from pathlib import Path
 from typing import List, Optional, Union
@@ -80,6 +80,7 @@ _TD_INTRADAY_CACHE = {}
 _FINRA_SI_CACHE = {}
 _FINRA_CALENDAR_CACHE = {"date": None, "dates": [], "timestamp": 0.0}
 _FINRA_PARTITION_CACHE = {"dates": [], "timestamp": 0.0}
+_LIVE_HALTS_CACHE = {"timestamp": 0.0, "records": {}, "list": [], "counts": {}, "refreshing": False}
 
 LULD_CODES = {"LUDP", "LUDS", "M"}
 
@@ -241,7 +242,28 @@ def request_with_retries(url: str, timeout: int = 20, max_attempts: int = 3) -> 
 
 def fetch_rss(url: str) -> feedparser.FeedParserDict:
     content = request_with_retries(url, timeout=20, max_attempts=3)
-    return feedparser.parse(content)
+    feed = feedparser.parse(content)
+    if feed.entries:
+        return feed
+    # fallback: direct requests with headers, and try http if https fails silently
+    try:
+        response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=20)
+        response.raise_for_status()
+        feed = feedparser.parse(response.content)
+        if feed.entries:
+            return feed
+    except Exception:
+        pass
+    if url.startswith("https://"):
+        try:
+            http_url = "http://" + url[len("https://"):]
+            response = requests.get(http_url, headers={"User-Agent": USER_AGENT}, timeout=20)
+            response.raise_for_status()
+            feed = feedparser.parse(response.content)
+            return feed
+        except Exception:
+            pass
+    return feed
 
 
 def fetch_alphavantage_quote(ticker: str) -> dict:
@@ -803,6 +825,40 @@ def normalize_row(row: dict) -> dict:
     return normalized
 
 
+def normalize_live_event(entry: dict) -> dict:
+    event_type = detect_event_type(entry)
+    ticker = get_first(entry, ["symbol", "ticker", "title"], "n/a")
+    company_name = get_first(entry, ["name"], "")
+    halt_date = get_first(entry, ["haltdate", "halt_date", "date"], "n/a")
+    halt_time = get_first(entry, ["halttime", "halt_time"], "n/a")
+    resume_date = get_first(entry, ["resumedate", "resume_date"], "")
+    resume_time = get_first(entry, ["resumetime", "resume_time"], "")
+    reason = get_first(entry, ["reasoncode", "reason_code", "reason"], "n/a")
+    title = ticker or "LIVE HALT"
+    if company_name:
+        subtitle = company_name
+    else:
+        subtitle = get_first(entry, ["exchange"], "")
+    return {
+        "event_id": event_id_for(entry, event_type),
+        "event_type": "LIVE",
+        "title": title,
+        "ticker": ticker,
+        "company_name": subtitle,
+        "halt_date": halt_date,
+        "halt_time": halt_time,
+        "resume_date": resume_date,
+        "resume_time": resume_time,
+        "reason": reason,
+        "source": entry.get("source", ""),
+        "exchange": get_first(entry, ["exchange"], ""),
+        "published": entry.get("published", ""),
+        "link": entry.get("link", ""),
+        "raw_event_type": event_type,
+        "timestamp": entry.get("published", ""),
+    }
+
+
 def parse_halt_datetime(entry: dict) -> Optional[float]:
     date_raw = get_first(entry, ["haltdate", "halt_date", "date"])
     time_raw = get_first(entry, ["halttime", "halt_time"])
@@ -956,6 +1012,170 @@ def fetch_trade_halts() -> List[dict]:
         logging.warning("NYSE CSV fetch failed: %s", exc)
 
     return []
+
+
+def fetch_trade_halts_with_sources() -> dict:
+    results = {"rss": [], "nasdaq_page": [], "nyse_csv": []}
+    try:
+        results["rss"] = fetch_rss_events()
+    except Exception as exc:
+        logging.warning("RSS fetch failed: %s", exc)
+    try:
+        results["nasdaq_page"] = fetch_nasdaq_page_events()
+    except Exception as exc:
+        logging.warning("Nasdaq page fetch failed: %s", exc)
+    try:
+        results["nyse_csv"] = fetch_nyse_events()
+    except Exception as exc:
+        logging.warning("NYSE CSV fetch failed: %s", exc)
+    return results
+
+
+def build_live_alert_record(entry: dict) -> dict:
+    event_type = detect_event_type(entry)
+    return {
+        "event_id": event_id_for(entry, event_type),
+        "event_type": "LIVE",
+        "ticker": get_first(entry, ["symbol", "ticker", "title"], "n/a"),
+        "company_name": get_first(entry, ["name"], ""),
+        "halt_date": get_first(entry, ["haltdate", "halt_date", "date"], "n/a"),
+        "halt_time": get_first(entry, ["halttime", "halt_time"], ""),
+        "resume_date": get_first(entry, ["resumedate", "resume_date"], ""),
+        "resume_time": get_first(entry, ["resumetime", "resume_time"], ""),
+        "reason": get_first(entry, ["reasoncode", "reason_code", "reason"], "n/a"),
+        "halt_direction": "",
+        "news_link": "n/a",
+        "news_summary": "n/a",
+        "price": "n/a",
+        "market_cap": "n/a",
+        "float": "n/a",
+        "overnight_change": None,
+        "short_interest_shares": None,
+        "short_interest_date": None,
+        "days_to_cover": None,
+        "important": False,
+        "source": entry.get("source", "unknown"),
+        "title": get_first(entry, ["symbol", "ticker", "title"], "n/a"),
+        "timestamp": entry.get("published", ""),
+    }
+
+
+def merge_live_records(records: list[dict]) -> list[dict]:
+    def prefer(value: str) -> bool:
+        return value not in ("", None, "n/a")
+
+    merged = {}
+    for record in records:
+        event_id = record.get("event_id") or record.get("ticker") or str(time.time())
+        current = merged.get(event_id)
+        if not current:
+            merged[event_id] = {**record, "sources": [record.get("source")]}
+            continue
+        for key, value in record.items():
+            if key in ("sources",):
+                continue
+            if prefer(value) and not prefer(current.get(key)):
+                current[key] = value
+        if record.get("source") and record.get("source") not in current.get("sources", []):
+            current.setdefault("sources", []).append(record.get("source"))
+    return list(merged.values())
+
+
+def build_live_halts_snapshot() -> list[dict]:
+    sources = fetch_trade_halts_with_sources()
+    normalized = []
+    for key in ("rss", "nasdaq_page", "nyse_csv"):
+        for item in sources.get(key, []):
+            record = normalize_live_event(item)
+            if record.get("event_id"):
+                normalized.append(record)
+    merged = merge_live_records(normalized)
+    merged.sort(
+        key=lambda item: (
+            item.get("halt_date", ""),
+            item.get("halt_time", ""),
+            item.get("ticker", ""),
+        ),
+        reverse=True,
+    )
+    _LIVE_HALTS_CACHE["timestamp"] = time.time()
+    _LIVE_HALTS_CACHE["list"] = merged
+    _LIVE_HALTS_CACHE["records"] = {item.get("event_id"): item for item in merged if item.get("event_id")}
+    _LIVE_HALTS_CACHE["counts"] = {
+        "rss_count": len(sources.get("rss", [])),
+        "nasdaq_count": len(sources.get("nasdaq_page", [])),
+        "nyse_count": len(sources.get("nyse_csv", [])),
+    }
+    return merged
+
+
+def refresh_live_halts_async() -> None:
+    if _LIVE_HALTS_CACHE.get("refreshing"):
+        return
+
+    def run():
+        try:
+            build_live_halts_snapshot()
+        finally:
+            _LIVE_HALTS_CACHE["refreshing"] = False
+
+    _LIVE_HALTS_CACHE["refreshing"] = True
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+
+
+def enrich_live_records(records: list[dict]) -> list[dict]:
+    enriched = []
+    cache = {}
+    for record in records:
+        ticker = record.get("ticker", "")
+        if ticker in cache:
+            news, market = cache[ticker]
+        else:
+            news, market = get_enrichment(ticker, record.get("company_name", ""))
+            cache[ticker] = (news, market)
+        reason = record.get("reason", "")
+        halt_direction = compute_halt_direction(reason, market)
+        important = bool(halt_direction == "Up" and news.get("found"))
+        enriched.append(
+            {
+                **record,
+                "news_link": news.get("link", "n/a"),
+                "news_summary": news.get("summary", "n/a"),
+                "price": market.get("price", "n/a"),
+                "market_cap": market.get("market_cap", "n/a"),
+                "float": market.get("float", "n/a"),
+                "overnight_change": market.get("overnight_change"),
+                "short_interest_shares": market.get("short_interest_shares"),
+                "short_interest_date": market.get("short_interest_date"),
+                "days_to_cover": market.get("days_to_cover"),
+                "halt_direction": halt_direction,
+                "important": important,
+            }
+        )
+    return enriched
+
+
+def enrich_live_record(record: dict) -> dict:
+    ticker = record.get("ticker", "")
+    news, market = get_enrichment(ticker, record.get("company_name", ""))
+    reason = record.get("reason", "")
+    halt_direction = compute_halt_direction(reason, market)
+    important = bool(halt_direction == "Up" and news.get("found"))
+    return {
+        **record,
+        "news_link": news.get("link", "n/a"),
+        "news_summary": news.get("summary", "n/a"),
+        "price": market.get("price", "n/a"),
+        "market_cap": market.get("market_cap", "n/a"),
+        "float": market.get("float", "n/a"),
+        "overnight_change": market.get("overnight_change"),
+        "short_interest_shares": market.get("short_interest_shares"),
+        "short_interest_date": market.get("short_interest_date"),
+        "days_to_cover": market.get("days_to_cover"),
+        "halt_direction": halt_direction,
+        "important": important,
+    }
 
 
 def format_compact(value: Optional[Union[float, int]]) -> str:
@@ -1508,20 +1728,23 @@ def render_alert_center_page() -> str:
       <button onclick="pauseAlerts()">Pause</button>
       <button onclick="resumeAlerts()">Resume</button>
       <button onclick="refreshAlerts()">Refresh</button>
+      <button onclick="loadLiveHalts()">Load Live Halts</button>
     </div>
   </header>
   <div class="layout">
     <aside class="sidebar">
       <div class="filters">
         <input id="search" placeholder="Search ticker or company" oninput="renderList()"/>
-        <select id="filter-type" onchange="renderList()">
+        <select id="filter-type" onchange="onFilterChange()">
           <option value="">All events</option>
           <option value="HALT">HALT</option>
           <option value="RESUME">RESUME</option>
+          <option value="LIVE">LIVE</option>
         </select>
         <label style="font-size:12px;color:#a4a9b6;">
           <input type="checkbox" id="filter-important" onchange="renderList()"/> Important only
         </label>
+        <div id="live-status" style="font-size:11px;color:#a4a9b6;"></div>
       </div>
       <div id="alert-list" class="alert-list"></div>
     </aside>
@@ -1532,6 +1755,9 @@ def render_alert_center_page() -> str:
   </div>
   <script>
     let alerts = [];
+    let liveHalts = [];
+    let currentList = [];
+    let selectedId = null;
     let selectedId = null;
 
     async function refreshAlerts() {
@@ -1542,8 +1768,43 @@ def render_alert_center_page() -> str:
       const initial = urlParams.get('alert');
       if (initial) {
         selectAlert(initial);
-      } else if (!selectedId && alerts.length) {
+        return;
+      }
+      if (selectedId && selectedId.startsWith('live:')) {
+        const liveId = selectedId.replace('live:', '');
+        const response = await fetch(`/api/live-halts/${encodeURIComponent(liveId)}`);
+        const enriched = await response.json();
+        renderAlertDetails(enriched);
+        return;
+      }
+      if (!selectedId && alerts.length) {
         selectAlert(alerts[0].event_id);
+      }
+    }
+
+    function onFilterChange() {
+      renderList();
+      const type = document.getElementById('filter-type').value;
+      if (type === 'LIVE' && liveHalts.length === 0) {
+        loadLiveHalts();
+      }
+    }
+
+    async function loadLiveHalts() {
+      const status = document.getElementById('live-status');
+      status.textContent = 'Loading live halts...';
+      try {
+        const response = await fetch('/api/live-halts');
+        const payload = await response.json();
+        liveHalts = payload.events || [];
+        const counts = `RSS ${payload.rss_count || 0} | Nasdaq ${payload.nasdaq_count || 0} | NYSE ${payload.nyse_count || 0}`;
+        status.textContent = payload.refreshing ? `Refreshing... ${counts}` : `Live halts loaded. ${counts}`;
+        if (payload.refreshing) {
+          setTimeout(loadLiveHalts, 1500);
+        }
+        renderList();
+      } catch (err) {
+        status.textContent = 'Failed to load live halts.';
       }
     }
 
@@ -1553,24 +1814,41 @@ def render_alert_center_page() -> str:
       const query = document.getElementById('search').value.toLowerCase();
       const type = document.getElementById('filter-type').value;
       const importantOnly = document.getElementById('filter-important').checked;
-      const filtered = alerts.filter(alert => {
+      const combined = [...alerts, ...liveHalts];
+      const filtered = combined.filter(alert => {
         const text = `${alert.ticker || ''} ${alert.company_name || ''}`.toLowerCase();
         if (query && !text.includes(query)) return false;
         if (type && alert.event_type !== type) return false;
         if (importantOnly && !alert.important) return false;
         return true;
       });
+      currentList = filtered;
+      if (!filtered.length) {
+        list.innerHTML = '<div style="padding:12px;color:#a4a9b6;font-size:12px;">No alerts to show.</div>';
+        return;
+      }
       filtered.forEach(alert => {
         const card = document.createElement('div');
         card.className = 'alert-card' + (alert.important ? ' important' : '');
-        card.onclick = () => selectAlert(alert.event_id);
+        card.onclick = () => selectAlertObject(alert);
         card.innerHTML = `
           <div class="title">${alert.title || alert.event_type}</div>
           <div class="meta">${alert.ticker || ''} • ${alert.halt_date || alert.resume_date || ''}</div>
-          <div class="meta">${alert.reason || ''}</div>
+          <div class="meta">${alert.reason || alert.raw_event_type || ''}</div>
         `;
         list.appendChild(card);
       });
+    }
+
+    async function selectAlertObject(alert) {
+      if (alert.event_type === 'LIVE' || !alert.event_id) {
+        selectedId = `live:${alert.event_id || ''}`;
+        const response = await fetch(`/api/live-halts/${encodeURIComponent(alert.event_id || '')}`);
+        const enriched = await response.json();
+        renderAlertDetails(enriched);
+        return;
+      }
+      selectAlert(alert.event_id);
     }
 
     async function selectAlert(id) {
@@ -1578,8 +1856,12 @@ def render_alert_center_page() -> str:
       history.replaceState(null, '', `/?alert=${encodeURIComponent(id)}`);
       const response = await fetch(`/api/alerts/${encodeURIComponent(id)}`);
       const alert = await response.json();
+      renderAlertDetails(alert);
+    }
+
+    function renderAlertDetails(alert) {
       const details = document.getElementById('alert-details');
-      if (!alert.event_id) {
+      if (!alert || (!alert.event_id && alert.event_type !== 'LIVE')) {
         details.innerHTML = '<h2>Alert not found</h2>';
         return;
       }
@@ -1594,6 +1876,9 @@ def render_alert_center_page() -> str:
           ${renderDetailLine('Resume date', alert.resume_date)}
           ${renderDetailLine('Resume time', alert.resume_time)}
           ${renderDetailLine('Reason', alert.reason)}
+          ${renderDetailLine('Exchange', alert.exchange)}
+          ${renderDetailLine('Published', alert.published)}
+          ${renderDetailLine('Source link', alert.link, true)}
           ${renderDetailLine('Halt direction', alert.halt_direction)}
           ${renderDetailLine('News link', alert.news_link, true)}
           ${renderDetailLine('News summary', alert.news_summary)}
@@ -1607,6 +1892,10 @@ def render_alert_center_page() -> str:
           ${renderDetailLine('Latest tweet', alert.latest_tweet, true)}
           ${renderDetailLine('Important', alert.important ? 'YES' : '')}
           ${renderDetailLine('Source', alert.source)}
+          ${renderDetailLine('Sources', alert.sources ? alert.sources.join(', ') : '')}
+          ${renderDetailLine('Exchange', alert.exchange)}
+          ${renderDetailLine('Published', alert.published)}
+          ${renderDetailLine('Source link', alert.link, true)}
           ${renderDetailLine('Event type', alert.event_type)}
           ${renderDetailLine('Timestamp', alert.timestamp)}
         </ul>
@@ -1643,6 +1932,10 @@ def render_alert_center_page() -> str:
 
     refreshAlerts();
     refreshStatus();
+    const initialType = document.getElementById('filter-type').value;
+    if (initialType === 'LIVE') {
+      loadLiveHalts();
+    }
     setInterval(refreshAlerts, 15000);
     setInterval(refreshStatus, 10000);
   </script>
@@ -1698,6 +1991,36 @@ def start_details_server() -> bool:
                 state = load_state()
                 alerts = list(reversed(state.get("recent_alerts", [])))
                 json_response(self, 200, alerts)
+                return
+            if parsed.path == "/api/live-halts":
+                cache_age = time.time() - _LIVE_HALTS_CACHE.get("timestamp", 0)
+                if cache_age > 60 or not _LIVE_HALTS_CACHE.get("list"):
+                    refresh_live_halts_async()
+                    if not _LIVE_HALTS_CACHE.get("list"):
+                        _LIVE_HALTS_CACHE["refreshing"] = True
+                merged = _LIVE_HALTS_CACHE.get("list", [])
+                counts = _LIVE_HALTS_CACHE.get("counts", {})
+                json_response(
+                    self,
+                    200,
+                    {
+                        "rss_count": counts.get("rss_count", 0),
+                        "nasdaq_count": counts.get("nasdaq_count", 0),
+                        "nyse_count": counts.get("nyse_count", 0),
+                        "refreshing": bool(_LIVE_HALTS_CACHE.get("refreshing")),
+                        "events": merged,
+                    },
+                )
+                return
+            if parsed.path.startswith("/api/live-halts/"):
+                event_id = unquote(parsed.path[len("/api/live-halts/"):])
+                cache_age = time.time() - _LIVE_HALTS_CACHE.get("timestamp", 0)
+                if cache_age > 60 or event_id not in _LIVE_HALTS_CACHE.get("records", {}):
+                    refresh_live_halts_async()
+                record = _LIVE_HALTS_CACHE.get("records", {}).get(event_id, {})
+                if record:
+                    record = enrich_live_record(record)
+                json_response(self, 200, record or {})
                 return
             if parsed.path.startswith("/api/alerts/"):
                 alert_id = unquote(parsed.path[len("/api/alerts/"):])
@@ -1764,7 +2087,7 @@ def start_details_server() -> bool:
             self.end_headers()
 
     try:
-        server = HTTPServer((DETAILS_HOST, DETAILS_PORT), Handler)
+        server = ThreadingHTTPServer((DETAILS_HOST, DETAILS_PORT), Handler)
     except OSError as exc:
         logging.warning("Details server failed to start: %s", exc)
         DETAILS_AVAILABLE = False
@@ -2047,6 +2370,11 @@ def main() -> None:
         help="Print notification integration status and exit",
     )
     parser.add_argument(
+        "--self-test-fetch",
+        action="store_true",
+        help="Print feed counts from each source and exit",
+    )
+    parser.add_argument(
         "--keep-alive-seconds",
         type=int,
         default=0,
@@ -2058,6 +2386,16 @@ def main() -> None:
         notifier = terminal_notifier_path()
         print("terminal_notifier:", notifier or "not found")
         print("details_url:", details_url("test-alert"))
+        return
+    if args.self_test_fetch:
+        sources = fetch_trade_halts_with_sources()
+        print("rss_count:", len(sources.get("rss", [])))
+        print("nasdaq_count:", len(sources.get("nasdaq_page", [])))
+        print("nyse_count:", len(sources.get("nyse_csv", [])))
+        for key in ("rss", "nasdaq_page", "nyse_csv"):
+            events = sources.get(key, [])
+            if events:
+                print(f"{key}_first:", events[0])
         return
 
     start_details_server()
