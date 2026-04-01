@@ -1704,6 +1704,14 @@ def start_details_server() -> bool:
                 state = load_state()
                 found = next((a for a in state.get("recent_alerts", []) if a.get("event_id") == alert_id), {})
                 if found:
+                    if found.get("news_link") == "n/a":
+                        news = fetch_news_summary(found.get("ticker", ""), found.get("company_name", ""))
+                        if news.get("found"):
+                            found = {
+                                **found,
+                                "news_link": news.get("link"),
+                                "news_summary": news.get("summary"),
+                            }
                     tweet_link = fetch_latest_tweet(found.get("ticker", ""), found.get("company_name", ""))
                     if tweet_link == "__x_unauthorized__":
                         found = {**found, "latest_tweet": "X API unauthorized. Check bearer token and plan."}
