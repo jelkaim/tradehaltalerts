@@ -1604,6 +1604,7 @@ def render_alert_center_page() -> str:
           ${renderDetailLine('Short interest shares', alert.short_interest_shares)}
           ${renderDetailLine('Short interest date', alert.short_interest_date)}
           ${renderDetailLine('Days to cover', alert.days_to_cover)}
+          ${renderDetailLine('Latest tweet', alert.latest_tweet, true)}
           ${renderDetailLine('Important', alert.important ? 'YES' : '')}
           ${renderDetailLine('Source', alert.source)}
           ${renderDetailLine('Event type', alert.event_type)}
@@ -1702,6 +1703,12 @@ def start_details_server() -> bool:
                 alert_id = unquote(parsed.path[len("/api/alerts/"):])
                 state = load_state()
                 found = next((a for a in state.get("recent_alerts", []) if a.get("event_id") == alert_id), {})
+                if found:
+                    tweet_link = fetch_latest_tweet(found.get("ticker", ""), found.get("company_name", ""))
+                    if tweet_link == "__x_unauthorized__":
+                        found = {**found, "latest_tweet": "X API unauthorized. Check bearer token and plan."}
+                    elif tweet_link:
+                        found = {**found, "latest_tweet": tweet_link}
                 json_response(self, 200, found or {})
                 return
             if not parsed.path.startswith("/alerts/"):

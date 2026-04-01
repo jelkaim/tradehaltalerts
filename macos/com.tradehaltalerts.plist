@@ -39,6 +39,8 @@
       <string></string>
       <key>HALT_ALERTS_OPEN_DETAILS</key>
       <string></string>
+      <key>HALT_ALERTS_DETAILS_PORT</key>
+      <string>8787</string>
     </dict>
     <key>StandardOutPath</key>
     <string>/Users/jelk/trade-halt-alerts/logs/launchagent.out</string>
