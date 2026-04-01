@@ -1674,6 +1674,7 @@ def main() -> None:
         event_id = f"test-alert-{test_ticker}-{int(time.time())}"
         more_details = maybe_details_url(event_id)
         market = fetch_market_data(test_ticker)
+        short_interest = fetch_finra_short_interest(test_ticker)
         lines = [
             "Test alert",
             f"Ticker: {test_ticker}",
@@ -1685,6 +1686,12 @@ def main() -> None:
             f"Market cap: {market.get('market_cap')}",
             f"Float: {market.get('float')}",
         ]
+        if short_interest.get("short_interest_shares"):
+            lines.append(f"Short interest shares: {short_interest.get('short_interest_shares')}")
+        if short_interest.get("short_interest_date"):
+            lines.append(f"Short interest date: {short_interest.get('short_interest_date')}")
+        if short_interest.get("days_to_cover") is not None:
+            lines.append(f"Days to cover: {short_interest.get('days_to_cover')}")
         if more_details:
             lines.append(f"More details: {more_details}")
         body = "\n".join(
@@ -1710,6 +1717,9 @@ def main() -> None:
                 "price": market.get("price"),
                 "market_cap": market.get("market_cap"),
                 "float": market.get("float"),
+                "short_interest_shares": short_interest.get("short_interest_shares"),
+                "short_interest_date": short_interest.get("short_interest_date"),
+                "days_to_cover": short_interest.get("days_to_cover"),
                 "catalyst_label": "noise",
                 "catalyst_confidence": 0.0,
                 "catalyst_rationale": "Test alert",
