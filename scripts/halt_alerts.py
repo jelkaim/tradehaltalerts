@@ -78,7 +78,7 @@ _SEC_UA_WARNED = False
 _AV_INTRADAY_CACHE = {}
 _TD_INTRADAY_CACHE = {}
 _FINRA_SI_CACHE = {}
-_FINRA_CALENDAR_CACHE = {"date": None, "timestamp": 0.0}
+_FINRA_CALENDAR_CACHE = {"date": None, "dates": [], "timestamp": 0.0}
 _FINRA_PARTITION_CACHE = {"dates": [], "timestamp": 0.0}
 
 LULD_CODES = {"LUDP", "LUDS", "M"}
@@ -480,50 +480,53 @@ def fetch_finra_short_interest(ticker: str) -> dict:
     if cached and now - cached.get("timestamp", 0) < 12 * 3600:
         return cached.get("data", {})
     try:
-        settlement_date = get_finra_latest_settlement_date()
-        compare_filters = [
-            {"compareType": "EQUAL", "fieldName": "symbolCode", "fieldValue": ticker.upper()}
-        ]
-        if settlement_date:
+        dates = fetch_finra_calendar_dates()
+        if not dates:
+            return {}
+        headers = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": USER_AGENT}
+        for settlement_date in dates[:5]:
+            compare_filters = [
+                {"compareType": "EQUAL", "fieldName": "symbolCode", "fieldValue": ticker.upper()}
+            ]
             compare_filters.append(
                 {"compareType": "EQUAL", "fieldName": "settlementDate", "fieldValue": settlement_date}
             )
-        payload = {"compareFilters": compare_filters, "limit": 50}
-        headers = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": USER_AGENT}
-        response = requests.post(FINRA_SHORT_INTEREST_URL, json=payload, headers=headers, timeout=20)
-        response.raise_for_status()
-        if response.status_code == 204 or not response.text.strip():
-            return {}
-        try:
-            data = response.json()
-        except Exception:
-            snippet = response.text[:200].replace("\n", " ")
-            logging.warning(
-                "FINRA short interest non-JSON response for %s: status=%s content-type=%s length=%s snippet=%s",
-                ticker,
-                response.status_code,
-                response.headers.get("Content-Type"),
-                len(response.text),
-                snippet,
-            )
-            return {}
-        if not isinstance(data, list) or not data:
-            return {}
-        # pick latest by settlementDate
-        def parse_date(item):
+            payload = {"compareFilters": compare_filters, "limit": 50}
+            response = requests.post(FINRA_SHORT_INTEREST_URL, json=payload, headers=headers, timeout=20)
+            response.raise_for_status()
+            if response.status_code == 204 or not response.text.strip():
+                continue
             try:
-                return datetime.fromisoformat(item.get("settlementDate", ""))
-            except ValueError:
-                return datetime.min
+                data = response.json()
+            except Exception:
+                snippet = response.text[:200].replace("\n", " ")
+                logging.warning(
+                    "FINRA short interest non-JSON response for %s: status=%s content-type=%s length=%s snippet=%s",
+                    ticker,
+                    response.status_code,
+                    response.headers.get("Content-Type"),
+                    len(response.text),
+                    snippet,
+                )
+                continue
+            if not isinstance(data, list) or not data:
+                continue
+            # pick latest by settlementDate
+            def parse_date(item):
+                try:
+                    return datetime.fromisoformat(item.get("settlementDate", ""))
+                except ValueError:
+                    return datetime.min
 
-        latest = max(data, key=parse_date)
-        result = {
-            "short_interest_shares": latest.get("currentShortPositionQuantity"),
-            "short_interest_date": latest.get("settlementDate"),
-            "days_to_cover": latest.get("daysToCoverQuantity"),
-        }
-        _FINRA_SI_CACHE[ticker] = {"timestamp": now, "data": result}
-        return result
+            latest = max(data, key=parse_date)
+            result = {
+                "short_interest_shares": latest.get("currentShortPositionQuantity"),
+                "short_interest_date": latest.get("settlementDate"),
+                "days_to_cover": latest.get("daysToCoverQuantity"),
+            }
+            _FINRA_SI_CACHE[ticker] = {"timestamp": now, "data": result}
+            return result
+        return {}
     except Exception as exc:
         logging.warning("FINRA short interest failed for %s: %s", ticker, exc)
         return {}
@@ -581,6 +584,20 @@ def get_finra_latest_settlement_date() -> Optional[str]:
         logging.warning("FINRA partition lookup failed: %s", exc)
     logging.warning("FINRA calendar did not return a settlement date")
     return None
+
+
+def fetch_finra_calendar_dates() -> list[str]:
+    if FINRA_SHORT_INTEREST_DATE:
+        return [FINRA_SHORT_INTEREST_DATE]
+    now = time.time()
+    cached_dates = _FINRA_CALENDAR_CACHE.get("dates", [])
+    if cached_dates and now - _FINRA_CALENDAR_CACHE.get("timestamp", 0) < 24 * 3600:
+        return cached_dates
+    latest = fetch_finra_settlement_from_calendar()
+    dates = _FINRA_CALENDAR_CACHE.get("dates", [])
+    if latest and latest not in dates:
+        dates.insert(0, latest)
+    return dates
 
 
 def fetch_finra_settlement_from_calendar() -> Optional[str]:
@@ -675,10 +692,12 @@ def fetch_finra_settlement_from_calendar() -> Optional[str]:
         if not dates:
             return None
         today = date_cls.today()
-        past_dates = [d for d in dates if d <= today]
+        past_dates = sorted({d for d in dates if d <= today}, reverse=True)
         if not past_dates:
             return None
-        latest = max(past_dates)
+        iso_dates = [d.isoformat() for d in past_dates]
+        _FINRA_CALENDAR_CACHE["dates"] = iso_dates
+        latest = past_dates[0]
         return latest.isoformat()
     except Exception as exc:
         logging.warning("FINRA calendar scrape failed: %s", exc)
